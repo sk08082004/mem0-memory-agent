@@ -1,4 +1,6 @@
-from ollama import chat
+import os
+
+from google import genai
 
 from app.memory import MemoryManager
 from app.config import USER_ID
@@ -11,17 +13,24 @@ class Agent:
 
     def __init__(self):
         self.memory = MemoryManager()
-        self.memory.initialize()
 
-    def remember(self, message):
+        self.client = genai.Client(
+            api_key=os.getenv("GEMINI_API_KEY")
+        )
+
+    def remember(self, message, response):
         """
-        Store important information from the conversation.
+        Store the conversation in Mem0.
         """
 
         messages = [
             {
                 "role": "user",
                 "content": message
+            },
+            {
+                "role": "assistant",
+                "content": response
             }
         ]
 
@@ -32,7 +41,7 @@ class Agent:
 
     def recall(self, query):
         """
-        Search long-term memory.
+        Search the user's long-term memories.
         """
 
         return self.memory.search(
@@ -42,54 +51,67 @@ class Agent:
 
     def respond(self, message):
         """
-        Generate an AI response using Qwen3.
+        Generate a response using Gemini
+        and relevant long-term memories.
         """
 
-        # 1. Search long-term memory
+        # 1. Search memory
         memories = self.recall(message)
 
         print("\nRelevant memories:")
         print(memories)
 
-        # 2. Convert memories into context
+        # 2. Prepare memory context
         memory_context = ""
 
-        if memories:
-            memory_context = "\n".join(
-                str(memory)
-                for memory in memories
-            )
+        if memories and "results" in memories:
+         memory_context = "\n".join(
+         item["memory"]
+         for item in memories["results"]
+        )
 
-        # 3. Build the prompt
+        # 3. Build prompt
         system_prompt = f"""
 You are a helpful AI assistant with long-term memory.
 
-Relevant information remembered about the user:
+Here are relevant memories about the user:
 
 {memory_context}
 
-Use the remembered information when it is relevant.
+Use these memories when they are relevant.
 Do not invent memories.
+If there are no relevant memories, simply answer normally.
 """
 
-        # 4. Ask Qwen3
-        response = chat(
-            model="qwen3:4b",
-            messages=[
+        # 4. Ask Gemini
+        response = self.client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=[
                 {
-                    "role": "system",
-                    "content": system_prompt
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": system_prompt
+                        }
+                    ]
                 },
                 {
                     "role": "user",
-                    "content": message
+                    "parts": [
+                        {
+                            "text": message
+                        }
+                    ]
                 }
             ]
         )
 
-        answer = response["message"]["content"]
+        answer = response.text
 
-        # 5. Store the conversation in Mem0
-        self.remember(message)
+        # 5. Store conversation
+        self.remember(
+            message,
+            answer
+        )
 
         return answer

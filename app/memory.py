@@ -1,105 +1,65 @@
-from mem0 import Memory
+import os
+
+from mem0 import MemoryClient
 
 
 class MemoryManager:
     """
-    Handles long-term memory using Mem0.
+    Handles long-term memory using Mem0 Cloud.
     """
 
     def __init__(self):
-        self.memory = None
-        self.initialized = False
+        api_key = os.getenv("MEM0_API_KEY")
 
-    def initialize(self):
-        """
-        Initialize Mem0 with Ollama.
-        """
+        if not api_key:
+            raise ValueError("MEM0_API_KEY is not set.")
 
-        config = {
-            "llm": {
-                "provider": "ollama",
-                "config": {
-                    "model": "qwen3:4b",
-                    "ollama_base_url": "http://localhost:11434",
-                    "temperature": 0.2,
-                    "max_tokens": 2000,
-                }
-            },
-
-            "embedder": {
-                "provider": "ollama",
-                "config": {
-                    "model": "nomic-embed-text:latest",
-                    "ollama_base_url": "http://localhost:11434",
-                }
-            },
-
-            "vector_store": {
-                "provider": "qdrant",
-                "config": {
-                    "path": "./data/qdrant"
-                }
-            },
-
-            "version": "v1.1",
-        }
-
-        self.memory = Memory.from_config(config)
-
-        self.initialized = True
-
-        print("Mem0 memory system ready.")
+        self.client = MemoryClient(api_key=api_key)
 
     def add(self, messages, user_id):
         """
-        Extract and store important information.
+        Store important information from a conversation.
         """
 
-        if not self.initialized:
-            raise RuntimeError("Memory system is not initialized.")
-
-        result = self.memory.add(
-            messages,
+        result = self.client.add(
+            messages=messages,
             user_id=user_id
         )
 
-        print("[MEMORY] Added/updated memory.")
+        print("[MEMORY] Memory added/updated.")
 
         return result
 
     def search(self, query, user_id):
         """
-        Search long-term memory.
+        Search the user's long-term memories.
         """
 
-        if not self.initialized:
-            raise RuntimeError("Memory system is not initialized.")
+        print(f"[MEMORY] Searching for: {query}")
 
-        results = self.memory.search(
+        results = self.client.search(
             query=query,
-            user_id=user_id
+            filters={
+                "user_id": user_id
+            }
         )
 
         return results
 
     def get_all(self, user_id):
         """
-        Retrieve all memories for a user.
+        Get all memories belonging to the user.
         """
 
-        if not self.initialized:
-            raise RuntimeError("Memory system is not initialized.")
-
-        return self.memory.get_all(
-            user_id=user_id
+        return self.client.get_all(
+            filters={
+                "user_id": user_id
+            }
         )
 
     def delete(self, memory_id):
         """
-        Delete a specific memory.
+        Delete one memory.
         """
 
-        if not self.initialized:
-            raise RuntimeError("Memory system is not initialized.")
-
-        return self.memory.delete(memory_id)
+        return self.client.delete(memory_id)

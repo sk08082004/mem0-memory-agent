@@ -1,24 +1,45 @@
 from app.agent import Agent
+from app.config import USER_ID
 
 
 def main():
     print("*" * 50)
     print("MEM0 LONG-TERM MEMORY AGENT")
     print("=" * 50)
-    print("type 'exit' to quit.\n")
+    print("Type 'exit' to quit.")
+    print("Type '/memories' to see your memories.\n")
 
     agent = Agent()
 
     while True:
-        user_input = input("You:").strip()
+        user_input = input("You: ").strip()
 
+        # Exit command
         if user_input.lower() == "exit":
             print("Goodbye!")
             break
 
+        # Show memories command
+        if user_input.lower() == "/memories":
+            memories = agent.memory.get_all(USER_ID)
+
+            print("\nStored memories:")
+            if memories["count"] == 0:
+                print("No memories stored.")
+
+            else:
+                for i, memory in enumerate(memories["results"], start=1):
+                 print(f"{i}. {memory['memory']}")
+
+            print()
+            continue
+
+
+        # Ignore empty input
         if not user_input:
             continue
 
+        # Normal conversation
         response = agent.respond(user_input)
 
         print(f"\nAgent: {response}\n")
@@ -26,5 +47,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
-
