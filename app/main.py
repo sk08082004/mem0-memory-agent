@@ -34,6 +34,38 @@ def main():
             print()
             continue
 
+        # forget memory command 
+        if user_input.lower().startswith("/forget"):
+            parts = user_input.split()
+
+            if len(parts) !=2:
+                print("\nUsage: /forget <number>\n")
+                continue
+
+            try:
+                memory_number = int(parts[1])
+            except ValueError:
+                print("\nPlease enter a memory number.\n")
+                continue
+
+            memories = agent.memory.get_all(USER_ID)
+
+            if memory_number < 1 or memory_number > memories["count"]:
+                print("\nInvalid memory number.\n")
+                continue
+
+            memory = memories["results"][memory_number -1]
+
+            memory_id = memory["id"]
+
+            print(f"\nDeleting: {memory['memory']}")
+
+            agent.memory.delete(memory_id)
+
+            print("Memory deleted.\n")
+
+            continue
+
 
         # Ignore empty input
         if not user_input:

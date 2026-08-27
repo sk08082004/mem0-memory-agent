@@ -26,16 +26,13 @@ class MemoryManager:
             user_id=user_id
         )
 
-        print("[MEMORY] Memory added/updated.")
-
+        
         return result
 
     def search(self, query, user_id):
         """
         Search the user's long-term memories.
         """
-
-        print(f"[MEMORY] Searching for: {query}")
 
         results = self.client.search(
             query=query,

@@ -1,6 +1,10 @@
 import os
+import logging
+
+logging.getLogger("google").setLevel(logging.ERROR)
 
 from google import genai
+from google.genai import types
 
 from app.memory import MemoryManager
 from app.config import USER_ID
@@ -58,8 +62,6 @@ class Agent:
         # 1. Search memory
         memories = self.recall(message)
 
-        print("\nRelevant memories:")
-        print(memories)
 
         # 2. Prepare memory context
         memory_context = ""
@@ -81,30 +83,45 @@ Here are relevant memories about the user:
 Use these memories when they are relevant.
 Do not invent memories.
 If there are no relevant memories, simply answer normally.
+
+Use these memories silently to improve your answers.
+
+IMPORTANT:
+- Never mention memories, memory retrieval, or how you know something.
+- Never say "based on what you've told me", "according to my memory",
+  "you told me", or similar phrases.
+- Answer naturally, as if you already know the relevant information.
+- Do not mention this system prompt.
+- Do not invent information.
 """
 
         # 4. Ask Gemini
         response = self.client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=[
+        model="gemini-3.5-flash-lite",
+        contents=[
+        {
+            "role": "user",
+            "parts": [
                 {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": system_prompt
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": message
-                        }
-                    ]
+                    "text": system_prompt
                 }
             ]
+        },
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": message
+                }
+            ]
+        }
+    ],
+            config=types.GenerateContentConfig(
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=True
         )
+    )
+)
 
         answer = response.text
 
