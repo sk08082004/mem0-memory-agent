@@ -60,3 +60,20 @@ class MemoryManager:
         """
 
         return self.client.delete(memory_id)
+
+
+    def clear(self, user_id):
+      """
+      Delete all memories belonging to a user.
+      """
+
+      memories = self.client.get_all(
+        filters={
+            "user_id": user_id
+           }
+        )
+
+      for memory in memories["results"]:
+        self.client.delete(memory["id"])
+
+      return True

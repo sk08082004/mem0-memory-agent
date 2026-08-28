@@ -7,7 +7,7 @@ def main():
     print("MEM0 LONG-TERM MEMORY AGENT")
     print("=" * 50)
     print("Type 'exit' to quit.")
-    print("Type '/memories' to see your memories.\n")
+    print("Type '/help' to see your commands.\n")
 
     agent = Agent()
 
@@ -66,7 +66,41 @@ def main():
 
             continue
 
+        #Clear all the memoires command 
+        if user_input.lower() == "/clear":
+            memories = agent.memory.get_all(USER_ID)
 
+            if memories["count"] == 0:
+                print("\nNo memories to clear.\n")
+                continue
+
+            confirm = input(f"\nThis wil delete {memories['count']} memories."
+                            "Are you sure? (yes/no):").strip().lower()
+
+
+            if confirm == "yes":
+                agent.memory.clear(USER_ID)
+                print("\nAll memories deleted.\n")
+
+            else:
+                print("\nMemory clearing cancelled.")
+
+            continue
+
+        #Help command 
+        if user_input.lower() == "/help":
+                print("""
+            Available commands:
+
+            /memories        View all stored memories. 
+            /forget <num>    Delete a specific memory.
+            /clear           Delete all memories.
+            /help            Show the help message.
+            exit             Exit the agent  
+                """)
+                continue
+
+             
         # Ignore empty input
         if not user_input:
             continue
