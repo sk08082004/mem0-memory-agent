@@ -21,24 +21,32 @@ def main():
 
         # Show memories command
         if user_input.lower() == "/memories":
-            memories = agent.memory.get_all(USER_ID)
+            try:
+                memories = agent.memory.get_all(USER_ID)
 
-            print("\nStored memories:")
-            if memories["count"] == 0:
-                print("No memories stored.")
+                print("\nStored memories:")
 
-            else:
-                for i, memory in enumerate(memories["results"], start=1):
-                 print(f"{i}. {memory['memory']}")
+                if memories["count"] == 0:
+                    print("No memories stored.")
 
-            print()
+                else:
+                    for i, memory in enumerate(
+                        memories["results"],
+                        start=1
+                    ):
+                        print(f"{i}. {memory['memory']}")
+
+                print()
+
+            except Exception as e:
+                print(f"\n[ERROR] Could not retrieve memories: {e}\n")
+
             continue
-
-        # forget memory command 
+        # forget memory command
         if user_input.lower().startswith("/forget"):
             parts = user_input.split()
 
-            if len(parts) !=2:
+            if len(parts) != 2:
                 print("\nUsage: /forget <number>\n")
                 continue
 
@@ -47,6 +55,28 @@ def main():
             except ValueError:
                 print("\nPlease enter a memory number.\n")
                 continue
+
+            try:
+                memories = agent.memory.get_all(USER_ID)
+
+                if memory_number < 1 or memory_number > memories["count"]:
+                    print("\nInvalid memory number.\n")
+                    continue
+
+                memory = memories["results"][memory_number - 1]
+
+                memory_id = memory["id"]
+
+                print(f"\nDeleting: {memory['memory']}")
+
+                agent.memory.delete(memory_id)
+
+                print("Memory deleted.\n")
+
+            except Exception as e:
+                print(f"\n[ERROR] Could not delete memory: {e}\n")
+
+            continue
 
             memories = agent.memory.get_all(USER_ID)
 
@@ -66,24 +96,37 @@ def main():
 
             continue
 
-        #Clear all the memoires command 
+        #Clear all the memoires command
         if user_input.lower() == "/clear":
-            memories = agent.memory.get_all(USER_ID)
+            try:
+                memories = agent.memory.get_all(USER_ID)
 
-            if memories["count"] == 0:
-                print("\nNo memories to clear.\n")
-                continue
+                if memories["count"] == 0:
+                    print("\nNo memories to clear.\n")
+                    continue
 
-            confirm = input(f"\nThis wil delete {memories['count']} memories."
-                            "Are you sure? (yes/no):").strip().lower()
+                confirm = input(
+                    f"\nThis wil delete {memories['count']} memories."
+                    "Are you sure? (yes/no): "
+                ).strip().lower()
 
+                if confirm == "yes":
+                    try:
+                        agent.memory.clear(USER_ID)
+                        print("\nAll memories deleted.\n")
 
-            if confirm == "yes":
-                agent.memory.clear(USER_ID)
-                print("\nAll memories deleted.\n")
+                    except Exception as e:
+                        print(
+                            f"\n[ERROR] Could not clear memories: {e}\n"
+                        )
 
-            else:
-                print("\nMemory clearing cancelled.")
+                else:
+                    print("\nMemory clearing cancelled.")
+
+            except Exception as e:
+                print(
+                    f"\n[ERROR] Could not retrieve memories: {e}\n"
+                )
 
             continue
 
@@ -95,10 +138,18 @@ def main():
             /memories        View all stored memories. 
             /forget <num>    Delete a specific memory.
             /clear           Delete all memories.
+            /new             Start a new conversation.
             /help            Show the help message.
             exit             Exit the agent  
                 """)
                 continue
+
+
+        #New conversation command
+        if user_input.lower() == "/new":
+            agent.conversation_history.clear
+            print("\nNew conversation started.\n")
+            continue
 
              
         # Ignore empty input
