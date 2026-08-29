@@ -149,31 +149,109 @@ class Agent:
         """
 
         prompt = f"""
-You are a memory decision system.
+You are the long-term memory decision system for an AI agent.
 
-Decide whether the user's message contains information
-that would be useful to remember for future conversations.
+Your job is to decide whether the user's message contains information
+that should be stored in long-term memory for future conversations.
 
-Remember things such as:
-- personal information
-- preferences
-- interests
-- goals
-- projects
-- skills
-- important relationships
-- recurring activities
-- important facts about the user
+Do NOT use a fixed list of categories or keywords to make this decision.
+The user may provide any kind of information, and potentially important
+information can appear in completely unexpected forms.
 
-Do not remember:
+Instead, judge the information based on its long-term value.
+
+Store information when it is likely to remain useful beyond the current
+conversation or situation. This includes information that helps the
+agent understand the user, their history, their projects, their work,
+their interests, their relationships, their decisions, their preferences,
+their plans, their experiences, their knowledge, or important context
+they have shared.
+
+Also remember substantial context from conversations when that context
+could help the agent understand or continue the user's work in a future
+conversation. If the user explains a project, system, idea, workflow,
+research, plan, or other ongoing subject in meaningful detail, preserve
+the important information from it rather than remembering only isolated
+sentences.
+
+The fact does not need to be permanent to be useful. Information can
+still be worth remembering if it is likely to remain relevant for a
+reasonable period of time or helps explain something about the user's
+ongoing situation.
+
+However, do NOT store information merely because it is currently
+happening.
+
+Temporary observations and momentary states should normally NOT be
+stored when they are likely to become irrelevant soon. For example:
+
+- someone is eating right now
+- someone is sleeping right now
+- it is raining right now
+- someone is currently watching TV
+- the user is currently sitting somewhere
+- a temporary action happening at this moment
+- ordinary small talk
 - greetings
-- casual conversation
-- temporary questions
-- requests for information
-- ordinary assistant interactions
-- information that is clearly irrelevant in future conversations
+- routine questions that have no lasting personal context
 
-The user's message is:
+The important distinction is between information that describes a
+temporary state and information that provides lasting context.
+
+For example:
+
+"Sandeep is eating right now."
+→ temporary state → normally do not remember.
+
+"Sandeep is my project partner."
+→ lasting context → remember.
+
+"I am working on a drone project."
+→ ongoing context → remember.
+
+"I am designing the navigation system for my drone using..."
+→ important project context → remember.
+
+"I made you."
+→ meaningful information about the relationship between the user
+and the agent → remember.
+
+"I saw something interesting today..."
+→ judge whether the information itself has lasting value; do not reject
+it simply because it is part of a current conversation.
+
+When a message contains a mixture of temporary and meaningful
+information, remember the meaningful information and ignore the
+temporary details.
+
+Prefer remembering useful information over aggressively filtering it.
+When uncertain, ask yourself:
+
+"If the user talks to this agent again days, weeks, or months from now,
+could knowing this information make the agent substantially more useful?"
+
+If yes, remember it.
+
+If the information is only useful for the immediate moment and is
+unlikely to matter later, do not remember it.
+
+Do not invent information or infer facts that the user did not actually
+provide.
+
+Return ONLY valid JSON in this exact format:
+
+{{
+    "should_remember": true
+}}
+
+or
+
+{{
+    "should_remember": false
+}}
+
+User message:
+
 
 "{message}"
 
