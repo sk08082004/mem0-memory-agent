@@ -142,131 +142,68 @@ class Agent:
         except Exception as e:
             print(f"\n[ERROR] Memory update failed: {e}\n")
 
-    def decide_memory(self, message):
+    def remember(self, message, response):
         """
-        Decide whether the user's message contains information
-        that should be stored as long-term memory.
+        Store the conversation in Mem0.
         """
 
         prompt = f"""
-You are the long-term memory decision system for an AI agent.
+Extract the important long-term information from the user's message.
 
-Your job is to decide whether the user's message contains information
-that should be stored in long-term memory for future conversations.
+The information may be about anything. Do not use a fixed list of
+categories.
 
-Do NOT use a fixed list of categories or keywords to make this decision.
-The user may provide any kind of information, and potentially important
-information can appear in completely unexpected forms.
+Keep information that is likely to remain useful in future conversations,
+including important context, ongoing projects, ideas, plans, experiences,
+relationships, preferences, and substantial explanations.
 
-Instead, judge the information based on its long-term value.
+Remove temporary details that are only relevant to the current moment.
 
-Store information when it is likely to remain useful beyond the current
-conversation or situation. This includes information that helps the
-agent understand the user, their history, their projects, their work,
-their interests, their relationships, their decisions, their preferences,
-their plans, their experiences, their knowledge, or important context
-they have shared.
+If the user provides a detailed explanation of a project, idea, system,
+research, workflow, or other ongoing subject, preserve the important
+information needed to understand that subject later.
 
-Also remember substantial context from conversations when that context
-could help the agent understand or continue the user's work in a future
-conversation. If the user explains a project, system, idea, workflow,
-research, plan, or other ongoing subject in meaningful detail, preserve
-the important information from it rather than remembering only isolated
-sentences.
+Do not invent information.
+Only extract information explicitly supported by the user's message.
 
-The fact does not need to be permanent to be useful. Information can
-still be worth remembering if it is likely to remain relevant for a
-reasonable period of time or helps explain something about the user's
-ongoing situation.
-
-However, do NOT store information merely because it is currently
-happening.
-
-Temporary observations and momentary states should normally NOT be
-stored when they are likely to become irrelevant soon. For example:
-
-- someone is eating right now
-- someone is sleeping right now
-- it is raining right now
-- someone is currently watching TV
-- the user is currently sitting somewhere
-- a temporary action happening at this moment
-- ordinary small talk
-- greetings
-- routine questions that have no lasting personal context
-
-The important distinction is between information that describes a
-temporary state and information that provides lasting context.
-
-For example:
-
-"Sandeep is eating right now."
-→ temporary state → normally do not remember.
-
-"Sandeep is my project partner."
-→ lasting context → remember.
-
-"I am working on a drone project."
-→ ongoing context → remember.
-
-"I am designing the navigation system for my drone using..."
-→ important project context → remember.
-
-"I made you."
-→ meaningful information about the relationship between the user
-and the agent → remember.
-
-"I saw something interesting today..."
-→ judge whether the information itself has lasting value; do not reject
-it simply because it is part of a current conversation.
-
-When a message contains a mixture of temporary and meaningful
-information, remember the meaningful information and ignore the
-temporary details.
-
-Prefer remembering useful information over aggressively filtering it.
-When uncertain, ask yourself:
-
-"If the user talks to this agent again days, weeks, or months from now,
-could knowing this information make the agent substantially more useful?"
-
-If yes, remember it.
-
-If the information is only useful for the immediate moment and is
-unlikely to matter later, do not remember it.
-
-Do not invent information or infer facts that the user did not actually
-provide.
-
-Return ONLY valid JSON in this exact format:
-
-{{
-    "should_remember": true
-}}
-
-or
-
-{{
-    "should_remember": false
-}}
+Return a concise list of standalone factual memories.
+Return ONLY the memories, one per line.
 
 User message:
-
-
-"{message}"
-
-Return ONLY valid JSON in this exact format:
-
-{{
-    "should_remember": true
-}}
-
-or
-
-{{
-    "should_remember": false
-}}
+{message}
 """
+
+        try:
+            extraction = self.client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
+                )
+            )
+
+            memory_text = extraction.text.strip()
+
+            if not memory_text:
+                return None
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": memory_text
+                }
+            ]
+
+            return self.memory.add(
+                messages,
+                USER_ID
+            )
+
+        except Exception as e:
+            print(f"\n[ERROR] Memory extraction/storage failed: {e}\n")
+            return None
 
         try:
             response = self.client.models.generate_content(
