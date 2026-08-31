@@ -74,12 +74,3 @@ Run:
 
 ```bash
 python -m app.main
-```
-
-## Status
-
-Core agent, memory pipeline, and CLI are complete. Web UI is in progress.
-
-## Author
-
-**Sunny Kumar**
