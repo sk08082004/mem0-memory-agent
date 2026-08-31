@@ -16,17 +16,17 @@ class MemoryManager:
 
         self.client = MemoryClient(api_key=api_key)
 
-    def add(self, messages, user_id):
+    def add(self, messages, user_id, metadata=None):
         """
         Store important information from a conversation.
         """
 
         result = self.client.add(
             messages=messages,
-            user_id=user_id
+            user_id=user_id,
+            metadata=metadata
         )
 
-        
         return result
 
     def search(self, query, user_id):
@@ -48,11 +48,16 @@ class MemoryManager:
         Get all memories belonging to the user.
         """
 
-        return self.client.get_all(
+        results = self.client.get_all(
             filters={
                 "user_id": user_id
             }
         )
+
+        print("\nRAW MEMO DATA:")
+        print(results)
+
+        return results
 
     def delete(self, memory_id):
         """

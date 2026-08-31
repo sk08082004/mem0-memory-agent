@@ -36,32 +36,77 @@ class Agent:
 
     def remember(self, message, response):
         """
-        Store the conversation in Mem0.
+        Extract important long-term information from the user's message
+        and assign an importance score to each memory.
         """
 
         prompt = f"""
-Extract the important long-term information from the user's message.
+You are a long-term memory extraction system for an AI agent.
 
-The information may be about anything. Do not use a fixed list of
-categories.
+Your job is to extract information from the user's message that
+could be useful in future conversations.
 
-Keep information that is likely to remain useful in future conversations,
-including important context, ongoing projects, ideas, plans, experiences,
-relationships, preferences, and substantial explanations.
+Do not use a fixed list of categories.
 
-Remove temporary details that are only relevant to the current moment.
+Judge each piece of information based on its long-term usefulness.
 
-If the user provides a detailed explanation of a project, idea, system,
-research, workflow, or other ongoing subject, preserve the important
-information needed to understand that subject later.
+Remember information such as:
+- Important personal context
+- Preferences
+- Relationships
+- Projects
+- Technical decisions
+- Ongoing work
+- Plans
+- Goals
+- Future events
+- Important experiences
+- Substantial context that may help the agent later
+
+Do NOT remember information that is only temporary or useful
+for the immediate moment, unless it has additional long-term value.
 
 Do not invent information.
 Only extract information explicitly supported by the user's message.
 
-Return a concise list of standalone factual memories.
-Return ONLY the memories, one per line.
+For every memory, assign an importance score from 1 to 10.
+
+Importance scale:
+
+1-3:
+Minor information with little future usefulness.
+
+4-6:
+Moderately useful information that may help in future conversations.
+
+7-8:
+Important information that provides meaningful long-term context.
+
+9-10:
+Highly important information that would substantially improve
+future conversations or represents very important long-term context.
+
+Prefer remembering useful information over aggressively filtering it.
+
+Return ONLY valid JSON in this exact format:
+
+{{
+    "memories": [
+        {{
+            "text": "standalone factual memory",
+            "importance": 8
+        }}
+    ]
+}}
+
+If there is nothing worth remembering, return:
+
+{{
+    "memories": []
+}}
 
 User message:
+
 {message}
 """
 
@@ -76,43 +121,42 @@ User message:
                 )
             )
 
-            memory_text = extraction.text.strip()
+            result = json.loads(extraction.text)
 
-            if not memory_text:
+            memories = result.get("memories", [])
+
+            if not memories:
                 return None
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": memory_text
-                }
-            ]
+            for memory in memories:
 
-            return self.memory.add(
-                messages,
-                USER_ID
-            )
+                memory_text = memory.get("text", "").strip()
+                importance = memory.get("importance", 5)
+
+                if not memory_text:
+                    continue
+
+                messages = [
+                    {
+                        "role": "user",
+                        "content": memory_text
+                    }
+                ]
+
+                self.memory.add(
+                    messages,
+                    USER_ID,
+                    metadata={
+                        "importance": importance
+                    }
+                )
+
+            return True
 
         except Exception as e:
             print(f"\n[ERROR] Memory extraction/storage failed: {e}\n")
             return None
 
-        messages = [
-            {
-                "role": "user",
-                "content": message
-            }
-        ]
-
-        try:
-            return self.memory.add(
-                messages,
-                USER_ID
-            )
-
-        except Exception as e:
-            print(f"\n[ERROR] Memory storage failed: {e}\n")
-            return None
 
     def recall(self, query):
         """
