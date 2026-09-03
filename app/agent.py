@@ -28,7 +28,8 @@ class Agent:
             )
 
         self.client = genai.Client(
-            api_key=api_key
+            api_key=api_key, 
+            http_options=types.HttpOptions(timeout=30000)
         )
 
         self.conversation_history = []
@@ -422,10 +423,43 @@ User message:
                 if item.get("score", 0) >= 0.15
             ]
 
+            #combine semantic relevance with memory importance. 
+            for item in relevant_memories:
+
+                #Sementic relevance from Mem0.
+                relevant_score = float(item.get("score", 0))
+
+                #Importance assigneed with the memory was created.
+                importance_score = float(item.get("metadata", {}).get("importance", 5))
+
+                importance_score = importance_score / 10
+
+                #Calculate how recent the memory is.
+                created_at = item.get("created_at")
+                recency_score = 0.5
+
+                if created_at:
+                    try:
+                        from datetime import datetime, timezone
+
+                        created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00" )) 
+                        now = datetime.now(timezone.utc)
+
+                        age_days = (now - created_time).total_seconds() / 86400
+
+                        #Memory loses half its recency score every 30 days. 
+                        recency_score = 2** (-age_days / 30)
+
+                    except Exception:
+                        recency_score = 0.5
+                #Final memory ranking. 
+                item["final_score"] = (relevant_score * 0.60 + importance_score * 0.25 + recency_score * 0.15)
+
+
             #Keep only the top 5 most relevant memories.
             relevant_memories = sorted(
                 relevant_memories,
-                key=lambda item: item.get("score", 0),
+                key=lambda item: item.get("final_score", 0),
                 reverse=True
             )[:5]
 

@@ -54,9 +54,6 @@ class MemoryManager:
             }
         )
 
-        print("\nRAW MEMO DATA:")
-        print(results)
-
         return results
 
     def delete(self, memory_id):
