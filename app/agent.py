@@ -28,8 +28,10 @@ class Agent:
             )
 
         self.client = genai.Client(
-            api_key=api_key, 
-            http_options=types.HttpOptions(timeout=30000)
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=30000
+            )
         )
 
         self.conversation_history = []
@@ -122,7 +124,18 @@ User message:
                 )
             )
 
-            result = json.loads(extraction.text)
+            response_text = extraction.text.strip()
+
+            if not response_text:
+                print("[MEMORY] Gemini returned an empty response.")
+                return None
+
+            if response_text.startswith("```"):
+                response_text = response_text.replace("```json", "")
+                response_text = response_text.replace("```", "")
+                response_text = response_text.strip()
+
+            result = json.loads(response_text)
 
             memories = result.get("memories", [])
 
@@ -155,9 +168,15 @@ User message:
             return True
 
         except Exception as e:
-            print(f"\n[ERROR] Memory extraction/storage failed: {e}\n")
-            return None
+            print(
+                f"\n[ERROR] Memory extraction/storage failed: {e}"
+            )
 
+            if "extraction" in locals():
+                print("[DEBUG] Gemini memory response:")
+                print(extraction.text)
+
+            return None
 
     def recall(self, query):
         """
@@ -171,12 +190,14 @@ User message:
             )
 
         except Exception as e:
-            print(f"\n[ERROR] Memory search failed: {e}\n")
+            print(
+                f"\n[ERROR] Memory search failed: {e}\n"
+            )
             return {"results": []}
-    
+
     def check_for_update(self, message):
         """
-        Check wether the new message may update an existing memory.
+        Check whether the new message may update an existing memory.
         """
 
         update_phrases = [
@@ -200,50 +221,114 @@ User message:
 
     def update_memory(self, message):
         """
-        Find and replace a specific outdated memory.
+        Use Gemini to identify outdated memories that conflict
+        with the user's newest message.
         """
 
         try:
+            # Get all existing memories for the user.
             memories = self.memory.get_all(USER_ID)
 
             if not memories or "results" not in memories:
                 return
 
-            message_lower = message.lower()
+            existing_memories = memories["results"]
 
-            # Check whether this is a negative preference update
-            if "don't like" in message_lower:
-                changed_item = message_lower.split("don't like", 1)[1]
-
-            elif "do not like" in message_lower:
-                changed_item = message_lower.split("do not like", 1)[1]
-
-            else:
+            if not existing_memories:
                 return
 
-            # Clean the changed item
-            changed_item = changed_item.replace("anymore", "")
-            changed_item = changed_item.strip(" .,!?:;'\"")
+            # Give Gemini the existing memories and the new message.
+            memory_list = "\n".join(
+                f"ID: {memory['id']} | Memory: {memory['memory']}"
+                for memory in existing_memories
+            )
 
-            # Create simple singular/plural variations
-            item_variations = {
-                changed_item,
-                changed_item.rstrip("s"),
-            }
+            prompt = f"""
+You are a memory conflict detection system.
 
-            for memory in memories["results"]:
-                memory_text = memory["memory"].lower()
+The user has provided a new message.
 
-                # Check whether this memory contains the changed item
-                if any(
-                    variation and variation in memory_text
-                    for variation in item_variations
-                ):
-                    print(f"[MEMORY] Updating: {memory['memory']}")
-                    self.memory.delete(memory["id"])
+Your job is to determine whether the new message
+contradicts or updates any existing long-term memories.
+
+Existing memories:
+
+{memory_list}
+
+New user message:
+
+"{message}"
+
+Rules:
+
+1. Only identify a memory as outdated if the new message
+clearly changes, contradicts, or replaces it.
+
+2. Do not assume information that the user did not provide.
+
+3. Do not delete memories merely because they are related
+to the new message.
+
+4. If the new message does not conflict with an existing
+memory, do not mark it for deletion.
+
+5. A newer preference or decision should replace an older
+preference or decision when they clearly conflict.
+
+6. Return only the IDs of memories that are definitely outdated.
+
+Return ONLY valid JSON in this format:
+
+{{
+    "outdated_memory_ids": [
+        "memory-id-1",
+        "memory-id-2"
+    ]
+}}
+
+If there are no conflicting memories, return:
+
+{{
+    "outdated_memory_ids": []
+}}
+"""
+
+            response = self.client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
+                )
+            )
+
+            result = json.loads(response.text)
+
+            outdated_ids = result.get(
+                "outdated_memory_ids",
+                []
+            )
+
+            # Delete only memories that Gemini identified
+            # as definitely outdated.
+            for memory_id in outdated_ids:
+
+                valid_memory = any(
+                    memory["id"] == memory_id
+                    for memory in existing_memories
+                )
+
+                if valid_memory:
+                    print(
+                        f"[MEMORY] Removing outdated memory: {memory_id}"
+                    )
+                    self.memory.delete(memory_id)
 
         except Exception as e:
-            print(f"\n[ERROR] Memory update failed: {e}\n")
+            print(
+                f"\n[ERROR] Memory conflict resolution failed: {e}\n"
+            )
 
     def decide_memory(self, message):
         """
@@ -398,10 +483,15 @@ User message:
 
             result = json.loads(response.text)
 
-            return result.get("should_remember", False)
+            return result.get(
+                "should_remember",
+                False
+            )
 
         except Exception as e:
-            print(f"\n[ERROR] Gemini memory decision failed: {e}\n")
+            print(
+                f"\n[ERROR] Gemini memory decision failed: {e}\n"
+            )
             return False
 
     def respond(self, message):
@@ -410,7 +500,7 @@ User message:
         and long-term memory.
         """
 
-        # Get relevant long-term memories
+        # Get relevant long-term memories.
         memories = self.recall(message)
 
         memory_context = ""
@@ -423,43 +513,70 @@ User message:
                 if item.get("score", 0) >= 0.15
             ]
 
-            #combine semantic relevance with memory importance. 
+            # Combine semantic relevance, importance, and recency.
             for item in relevant_memories:
 
-                #Sementic relevance from Mem0.
-                relevant_score = float(item.get("score", 0))
+                # Semantic relevance from Mem0.
+                relevance_score = float(
+                    item.get("score", 0)
+                )
 
-                #Importance assigneed with the memory was created.
-                importance_score = float(item.get("metadata", {}).get("importance", 5))
+                # Importance assigned when the memory was created.
+                importance_score = float(
+                    item.get("metadata", {}).get(
+                        "importance",
+                        5
+                    )
+                )
 
+                # Convert importance from 1-10 to 0-1.
                 importance_score = importance_score / 10
 
-                #Calculate how recent the memory is.
+                # Calculate how recent the memory is.
                 created_at = item.get("created_at")
+
                 recency_score = 0.5
 
                 if created_at:
                     try:
                         from datetime import datetime, timezone
 
-                        created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00" )) 
+                        created_time = datetime.fromisoformat(
+                            created_at.replace(
+                                "Z",
+                                "+00:00"
+                            )
+                        )
+
                         now = datetime.now(timezone.utc)
 
-                        age_days = (now - created_time).total_seconds() / 86400
+                        age_days = (
+                            now - created_time
+                        ).total_seconds() / 86400
 
-                        #Memory loses half its recency score every 30 days. 
-                        recency_score = 2** (-age_days / 30)
+                        # Memory loses half its recency score
+                        # every 30 days.
+                        recency_score = 2 ** (
+                            -age_days / 30
+                        )
 
                     except Exception:
                         recency_score = 0.5
-                #Final memory ranking. 
-                item["final_score"] = (relevant_score * 0.60 + importance_score * 0.25 + recency_score * 0.15)
 
+                # Final memory ranking.
+                item["final_score"] = (
+                    relevance_score * 0.60
+                    + importance_score * 0.25
+                    + recency_score * 0.15
+                )
 
-            #Keep only the top 5 most relevant memories.
+            # Keep only the top 5 memories by final score.
             relevant_memories = sorted(
                 relevant_memories,
-                key=lambda item: item.get("final_score", 0),
+                key=lambda item: item.get(
+                    "final_score",
+                    0
+                ),
                 reverse=True
             )[:5]
 
@@ -468,21 +585,23 @@ User message:
                 for item in relevant_memories
             )
 
-        # Add user's message to short-term memory
+        # Add user's message to short-term memory.
         self.conversation_history.append({
             "role": "user",
             "text": message
         })
 
-        # Keep only recent conversation
-        recent_history = self.conversation_history[-self.max_history:]
+        # Keep only recent conversation.
+        recent_history = self.conversation_history[
+            -self.max_history:
+        ]
 
         conversation_context = "\n".join(
             f"{item['role']}: {item['text']}"
             for item in recent_history
         )
 
-        # Give Gemini both types of context
+        # Give Gemini both types of context.
         system_prompt = f"""
 You are a helpful AI assistant with long-term memory.
 
@@ -530,19 +649,24 @@ Answer naturally.
 
         answer = response.text
 
-        # Add AI response to short-term memory
+        # Add AI response to short-term memory.
         self.conversation_history.append({
             "role": "assistant",
             "text": answer
         })
 
-        # Store only potentially useful information
+        # Handle possible memory updates and conflicts.
         if self.check_for_update(message):
 
             self.update_memory(message)
 
+            # Store the new information if it is worth remembering.
+            if self.decide_memory(message):
+                self.remember(message, answer)
+
         else:
 
+            # Store normal long-term information.
             if self.decide_memory(message):
                 self.remember(message, answer)
 
