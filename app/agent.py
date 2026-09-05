@@ -8,7 +8,6 @@ from google import genai
 from google.genai import types
 
 from app.memory import MemoryManager
-from app.config import USER_ID
 
 
 class Agent:
@@ -16,7 +15,8 @@ class Agent:
     AI agent with long-term memory.
     """
 
-    def __init__(self):
+    def __init__(self, user_id):
+        self.user_id = user_id
         self.memory = MemoryManager()
 
         api_key = os.getenv("GEMINI_API_KEY")
@@ -159,7 +159,7 @@ User message:
 
                 self.memory.add(
                     messages,
-                    USER_ID,
+                    self.user_id,
                     metadata={
                         "importance": importance
                     }
@@ -186,7 +186,7 @@ User message:
         try:
             return self.memory.search(
                 query,
-                USER_ID
+                self.user_id
             )
 
         except Exception as e:
@@ -227,7 +227,7 @@ User message:
 
         try:
             # Get all existing memories for the user.
-            memories = self.memory.get_all(USER_ID)
+            memories = self.memory.get_all(self.user_id)
 
             if not memories or "results" not in memories:
                 return
