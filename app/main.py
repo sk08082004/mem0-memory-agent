@@ -59,14 +59,54 @@ def main():
                         memories["results"],
                         start=1
                     ):
-                        print(f"{i}. {memory['memory']}")
-
+                        
+                        print(f"{i}. {memory['memory']}")  
+                    
                 print()
 
             except Exception as e:
                 print(f"\n[ERROR] Could not retrieve memories: {e}\n")
 
             continue
+
+
+        #show detailed information about a memory
+        if user_input.lower().startswith("/memory-info"):
+            parts = user_input.split()
+
+            if len(parts) !=2:
+                print("\nUsage: /memory-info <number>\n")
+                continue
+
+            try:
+                memory_number = int(parts[1])
+            except ValueError:
+                  print("\nPlease enter a valid memory number.\n")
+                  continue
+
+            try: 
+                memories = agent.memory.get_all(agent.user_id)
+
+                if memory_number < 1 or memory_number > memories["count"]:
+                   print("\nInvalid memory number.\n")
+                   continue
+
+                memory = memories["results"][memory_number - 1]
+                metadata = memory.get("metadata", {})
+
+                print("\nMemory details:")
+                print(f"Memory: {memory['memory']}")
+                print(f"Importance: {metadata.get('importance', 'N/A')}")
+                print(f"Reason: {metadata.get('reason', 'N/A')}")
+                print(f"Source: {metadata.get('source', 'N/A')}")
+                print(f"Created: {memory.get('created_at', 'N/A')}")
+                print(f"Updated: {memory.get('updated_at', 'N/A')}")
+                print()
+
+            except Exception as e:
+                   print(f"\n[ERROR] Could not retrieve memory details: {e}\n")
+
+                   continue
         #Show current user 
         if user_input.lower() == "/user":
             print(f"\ncurrent user: {agent.user_id}\n")
@@ -183,15 +223,16 @@ def main():
                 print("""
             Available commands:
 
-            /memories        View all stored memories. 
-            /forget <num>    Delete a specific memory.
-            /clear           Delete all memories.
-            /new             Start a new conversation.
-            /user            Show current user. 
-            /login </d>      Switch to another user. 
-            /logout          Logout and choose.
-            /help            Show the help message.
-            exit             Exit the agent  
+            /memories              View all stored memories.
+            /memory-info <num>     Show detailed memory provenance. 
+            /forget <num>          Delete a specific memory.
+            /clear                 Delete all memories.
+            /new                   Start a new conversation.
+            /user                  Show current user. 
+            /login </d>            Switch to another user. 
+            /logout                Logout and choose.
+            /help                  Show the help message.
+            exit                   Exit the agent  
                 """)
                 continue
 

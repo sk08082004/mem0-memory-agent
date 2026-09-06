@@ -91,6 +91,10 @@ future conversations or represents very important long-term context.
 
 Prefer remembering useful information over aggressively filtering it.
 
+For every memory, also provide a shoruy reason explaining why the information is worth remembering. 
+
+The reason must be based only on the user's message. 
+
 Return ONLY valid JSON in this exact format:
 
 {{
@@ -98,6 +102,7 @@ Return ONLY valid JSON in this exact format:
         {{
             "text": "standalone factual memory",
             "importance": 8
+            "reason": "why this information is worth remembering"
         }}
     ]
 }}
@@ -146,6 +151,7 @@ User message:
 
                 memory_text = memory.get("text", "").strip()
                 importance = memory.get("importance", 5)
+                reason = memory.get("reason", "not specified")
 
                 if not memory_text:
                     continue
@@ -161,7 +167,9 @@ User message:
                     messages,
                     self.user_id,
                     metadata={
-                        "importance": importance
+                        "importance": importance, 
+                        "reason": reason,
+                        "source": "conversation"
                     }
                 )
 
