@@ -39,8 +39,9 @@ class Agent:
 
     def remember(self, message, response):
         """
-        Extract important long-term information from the user's message
-        and assign an importance score to each memory.
+        Extract important long-term information from the user's message.
+        Before storing each extracted memory, check for duplicate or
+        highly similar existing memories and merge them when necessary.
         """
 
         prompt = f"""
@@ -91,9 +92,10 @@ future conversations or represents very important long-term context.
 
 Prefer remembering useful information over aggressively filtering it.
 
-For every memory, also provide a short reason explaining why the information is worth remembering. 
+For every memory, also provide a short reason explaining why the
+information is worth remembering.
 
-The reason must be based only on the user's message. 
+The reason must be based only on the user's message.
 
 Return ONLY valid JSON in this exact format:
 
@@ -141,19 +143,31 @@ User message:
                 response_text = response_text.strip()
 
             result = json.loads(response_text)
-
             memories = result.get("memories", [])
 
             if not memories:
                 return None
 
-            for memory in memories:
+            stored_any = False
 
+            for memory in memories:
                 memory_text = memory.get("text", "").strip()
                 importance = memory.get("importance", 5)
                 reason = memory.get("reason", "not specified")
 
                 if not memory_text:
+                    continue
+
+                # Check whether this newly extracted memory duplicates
+                # an existing memory before storing it.
+                was_deduplicated = self.deduplicate_memory(
+                    memory_text,
+                    importance,
+                    reason
+                )
+
+                if was_deduplicated:
+                    stored_any = True
                     continue
 
                 messages = [
@@ -167,13 +181,15 @@ User message:
                     messages,
                     self.user_id,
                     metadata={
-                        "importance": importance, 
+                        "importance": importance,
                         "reason": reason,
                         "source": "conversation"
                     }
                 )
 
-            return True
+                stored_any = True
+
+            return stored_any
 
         except Exception as e:
             print(
@@ -185,6 +201,186 @@ User message:
                 print(extraction.text)
 
             return None
+
+    def deduplicate_memory(self, memory_text, importance, reason):
+        """
+        Check whether a newly extracted memory duplicates or closely
+        overlaps existing memories. If it does, Gemini creates one
+        consolidated memory and the old duplicate memories are replaced.
+        """
+
+        try:
+            # First use semantic search to find only memories that may
+            # be related to the new candidate.
+            similar_memories = self.recall(memory_text)
+
+            if not similar_memories or "results" not in similar_memories:
+                return False
+
+            candidates = [
+                item
+                for item in similar_memories["results"]
+                if item.get("score", 0) >= 0.15
+            ]
+
+            # Limit the comparison so we do not send the entire memory
+            # database to Gemini.
+            candidates = sorted(
+                candidates,
+                key=lambda item: item.get("score", 0),
+                reverse=True
+            )[:5]
+
+            if not candidates:
+                return False
+
+            memory_list = "\n".join(
+                f"ID: {memory['id']} | Memory: {memory['memory']}"
+                for memory in candidates
+            )
+
+            prompt = f"""
+You are the memory deduplication system for an AI assistant.
+
+A new memory has just been extracted from the user's message.
+Your job is to determine whether it duplicates or substantially
+represents the same information as one or more existing memories.
+
+New memory:
+"{memory_text}"
+
+Existing potentially similar memories:
+{memory_list}
+
+Rules:
+1. Use semantic meaning, not exact wording.
+2. Mark memories as duplicates when they express the same fact,
+   preference, plan, event, decision, or other substantially identical
+   information.
+3. Similar subject matter alone is NOT enough. For example,
+   "User likes apples" and "User likes mangoes" are different memories.
+4. If the new memory adds useful information to an existing memory,
+   treat them as duplicates that should be merged when they describe
+   the same underlying fact.
+5. Do not merge unrelated memories.
+6. When duplicates exist, create ONE complete standalone merged memory.
+7. Preserve useful information from the existing memories that remains
+   true and incorporate the useful new information.
+8. Do not invent facts.
+9. If there are no duplicates, return an empty duplicate_memory_ids list.
+10. The new memory should not remain as a separate duplicate after a merge.
+11. Provide an importance score from 1 to 10 for the merged memory.
+12. Provide a short reason explaining why the merged memory is worth
+    remembering.
+
+Return ONLY valid JSON in this exact format:
+
+{{
+    "duplicate_memory_ids": [
+        "existing-memory-id"
+    ],
+    "merged_memory": "complete standalone merged memory",
+    "importance": 8,
+    "reason": "why the merged information is worth remembering"
+}}
+
+If there are no duplicates, return:
+
+{{
+    "duplicate_memory_ids": [],
+    "merged_memory": "",
+    "importance": 0,
+    "reason": ""
+}}
+"""
+
+            response = self.client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
+                )
+            )
+
+            response_text = response.text.strip()
+
+            if not response_text:
+                print("[MEMORY] Gemini returned an empty deduplication response.")
+                return False
+
+            if response_text.startswith("```"):
+                response_text = response_text.replace("```json", "")
+                response_text = response_text.replace("```", "")
+                response_text = response_text.strip()
+
+            result = json.loads(response_text)
+            duplicate_ids = result.get("duplicate_memory_ids", [])
+
+            if not duplicate_ids:
+                return False
+
+            valid_ids = {memory["id"] for memory in candidates}
+            duplicate_ids = [
+                memory_id
+                for memory_id in duplicate_ids
+                if memory_id in valid_ids
+            ]
+
+            if not duplicate_ids:
+                return False
+
+            merged_memory = result.get("merged_memory", "").strip()
+
+            if not merged_memory:
+                print("[MEMORY] Deduplication found duplicates but no merged memory was returned.")
+                return False
+
+            merged_importance = result.get("importance", importance)
+            merged_reason = result.get(
+                "reason",
+                "Merged from duplicate memories."
+            )
+
+            # Delete only IDs that our own semantic search provided to Gemini.
+            for memory_id in duplicate_ids:
+                print(f"[MEMORY] Removing duplicate memory: {memory_id}")
+                self.memory.delete(memory_id)
+
+            # Store one consolidated memory.
+            messages = [
+                {
+                    "role": "user",
+                    "content": merged_memory
+                }
+            ]
+
+            self.memory.add(
+                messages,
+                self.user_id,
+                metadata={
+                    "importance": merged_importance,
+                    "reason": merged_reason,
+                    "source": "conversation"
+                }
+            )
+
+            print("[MEMORY] Duplicate memories merged successfully.")
+            return True
+
+        except Exception as e:
+            print(
+                f"\n[ERROR] Memory deduplication failed: {e}\n"
+            )
+
+            if "response" in locals():
+                print("[DEBUG] Gemini deduplication response:")
+                print(response.text)
+
+            # If deduplication fails, return False so the caller can still
+            # store the new memory normally rather than losing information.
+            return False
 
     def recall(self, query):
         """
@@ -543,7 +739,7 @@ User message:
             candidate_memories = [
                 item
                 for item in memories["results"]
-                if item.get("score", 0) >= 0.15
+                if item.get("score", 0) >= 0.35
             ]
 
             candidate_memories = sorted(
