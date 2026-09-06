@@ -91,7 +91,7 @@ future conversations or represents very important long-term context.
 
 Prefer remembering useful information over aggressively filtering it.
 
-For every memory, also provide a shoruy reason explaining why the information is worth remembering. 
+For every memory, also provide a short reason explaining why the information is worth remembering. 
 
 The reason must be based only on the user's message. 
 
@@ -101,7 +101,7 @@ Return ONLY valid JSON in this exact format:
     "memories": [
         {{
             "text": "standalone factual memory",
-            "importance": 8
+            "importance": 8,
             "reason": "why this information is worth remembering"
         }}
     ]
@@ -203,63 +203,36 @@ User message:
             )
             return {"results": []}
 
-    def check_for_update(self, message):
+    def update_memory(self, message, candidate_memories):
         """
-        Check whether the new message may update an existing memory.
+        Use Gemini to determine whether the new message changes any
+        relevant existing memories and, if so, create the updated versions.
+
+        This runs on every user message. It does not depend on keywords.
         """
 
-        update_phrases = [
-            "no longer",
-            "don't like",
-            "do not like",
-            "doesn't like",
-            "does not like",
-            "instead",
-            "now",
-            "anymore",
-            "changed",
-        ]
-
-        message_lower = message.lower()
-
-        return any(
-            phrase in message_lower
-            for phrase in update_phrases
-        )
-
-    def update_memory(self, message):
-        """
-        Use Gemini to identify outdated memories that conflict
-        with the user's newest message.
-        """
+        if not candidate_memories:
+            return False
 
         try:
-            # Get all existing memories for the user.
-            memories = self.memory.get_all(self.user_id)
-
-            if not memories or "results" not in memories:
-                return
-
-            existing_memories = memories["results"]
-
-            if not existing_memories:
-                return
-
-            # Give Gemini the existing memories and the new message.
             memory_list = "\n".join(
                 f"ID: {memory['id']} | Memory: {memory['memory']}"
-                for memory in existing_memories
+                for memory in candidate_memories
             )
 
             prompt = f"""
-You are a memory conflict detection system.
+You are the memory evolution system for an AI assistant.
 
-The user has provided a new message.
+Your job is to determine whether the user's NEW message changes,
+updates, replaces, or corrects any of the EXISTING memories below.
 
-Your job is to determine whether the new message
-contradicts or updates any existing long-term memories.
+Do this using semantic understanding, not keywords.
+A user may express a change indirectly, briefly, or using a reference
+such as "that meeting", "make it 12", or "I prefer the other one".
+Use the existing memories and the new message together to understand
+what the user means.
 
-Existing memories:
+Existing relevant memories:
 
 {memory_list}
 
@@ -268,36 +241,38 @@ New user message:
 "{message}"
 
 Rules:
+1. Return an update only when the new message clearly changes,
+   corrects, replaces, or modifies an existing memory.
+2. Do not treat a merely related message as an update.
+3. Resolve references such as "that", "it", "the meeting", or "the old one"
+   using the existing memories when the meaning is clear.
+4. When a memory is updated, rewrite it as a complete standalone factual
+   statement containing the newest information.
+5. Preserve important information from the old memory that is still true.
+6. Do not invent facts or details that are not supported by the old memory
+   and the new message.
+7. If multiple memories are changed, return all of them.
+8. If nothing is changed, return an empty updates list.
+9. For every updated memory, provide an importance score from 1 to 10
+   and a short reason based on the user's new message and the updated fact.
 
-1. Only identify a memory as outdated if the new message
-clearly changes, contradicts, or replaces it.
-
-2. Do not assume information that the user did not provide.
-
-3. Do not delete memories merely because they are related
-to the new message.
-
-4. If the new message does not conflict with an existing
-memory, do not mark it for deletion.
-
-5. A newer preference or decision should replace an older
-preference or decision when they clearly conflict.
-
-6. Return only the IDs of memories that are definitely outdated.
-
-Return ONLY valid JSON in this format:
+Return ONLY valid JSON in this exact format:
 
 {{
-    "outdated_memory_ids": [
-        "memory-id-1",
-        "memory-id-2"
+    "updates": [
+        {{
+            "memory_id": "existing-memory-id",
+            "text": "complete updated standalone memory",
+            "importance": 8,
+            "reason": "why the updated information is worth remembering"
+        }}
     ]
 }}
 
-If there are no conflicting memories, return:
+If there are no updates, return:
 
 {{
-    "outdated_memory_ids": []
+    "updates": []
 }}
 """
 
@@ -311,32 +286,80 @@ If there are no conflicting memories, return:
                 )
             )
 
-            result = json.loads(response.text)
+            response_text = response.text.strip()
 
-            outdated_ids = result.get(
-                "outdated_memory_ids",
-                []
-            )
+            if not response_text:
+                print("[MEMORY] Gemini returned an empty update response.")
+                return False
 
-            # Delete only memories that Gemini identified
-            # as definitely outdated.
-            for memory_id in outdated_ids:
+            if response_text.startswith("```"):
+                response_text = response_text.replace("```json", "")
+                response_text = response_text.replace("```", "")
+                response_text = response_text.strip()
 
-                valid_memory = any(
-                    memory["id"] == memory_id
-                    for memory in existing_memories
-                )
+            result = json.loads(response_text)
+            updates = result.get("updates", [])
 
-                if valid_memory:
-                    print(
-                        f"[MEMORY] Removing outdated memory: {memory_id}"
-                    )
+            if not updates:
+                return False
+
+            valid_ids = {memory["id"] for memory in candidate_memories}
+            updated_any = False
+
+            for update in updates:
+                memory_id = update.get("memory_id")
+                memory_text = update.get("text", "").strip()
+                importance = update.get("importance", 5)
+                reason = update.get("reason", "Updated based on the user's latest message.")
+
+                # Never allow Gemini to modify a memory that was not
+                # provided as a candidate by our application.
+                if memory_id not in valid_ids:
+                    continue
+
+                if not memory_text:
+                    continue
+
+                try:
+                    print(f"[MEMORY] Updating memory: {memory_id}")
                     self.memory.delete(memory_id)
+
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": memory_text
+                        }
+                    ]
+
+                    self.memory.add(
+                        messages,
+                        self.user_id,
+                        metadata={
+                            "importance": importance,
+                            "reason": reason,
+                            "source": "conversation"
+                        }
+                    )
+
+                    updated_any = True
+
+                except Exception as e:
+                    print(
+                        f"\n[ERROR] Could not update memory {memory_id}: {e}\n"
+                    )
+
+            return updated_any
 
         except Exception as e:
             print(
-                f"\n[ERROR] Memory conflict resolution failed: {e}\n"
+                f"\n[ERROR] Memory update analysis failed: {e}\n"
             )
+
+            if "response" in locals():
+                print("[DEBUG] Gemini memory update response:")
+                print(response.text)
+
+            return False
 
     def decide_memory(self, message):
         """
@@ -511,6 +534,31 @@ User message:
         # Get relevant long-term memories.
         memories = self.recall(message)
 
+        # Check every message for possible memory updates.
+        # Mem0 finds likely related memories first, then Gemini decides
+        # whether the new message actually changes any of them.
+        candidate_memories = []
+
+        if memories and "results" in memories:
+            candidate_memories = [
+                item
+                for item in memories["results"]
+                if item.get("score", 0) >= 0.15
+            ]
+
+            candidate_memories = sorted(
+                candidate_memories,
+                key=lambda item: item.get("score", 0),
+                reverse=True
+            )[:10]
+
+        was_updated = self.update_memory(message, candidate_memories)
+
+        # If a memory changed, retrieve again so the response uses the
+        # newly stored version instead of the outdated one.
+        if was_updated:
+            memories = self.recall(message)
+
         memory_context = ""
 
         if memories and "results" in memories:
@@ -663,19 +711,10 @@ Answer naturally.
             "text": answer
         })
 
-        # Handle possible memory updates and conflicts.
-        if self.check_for_update(message):
-
-            self.update_memory(message)
-
-            # Store the new information if it is worth remembering.
-            if self.decide_memory(message):
-                self.remember(message, answer)
-
-        else:
-
-            # Store normal long-term information.
-            if self.decide_memory(message):
-                self.remember(message, answer)
+        # Store normal long-term information only when the message did not
+        # update an existing memory. Updated memories have already been
+        # replaced by update_memory().
+        if not was_updated and self.decide_memory(message):
+            self.remember(message, answer)
 
         return answer
