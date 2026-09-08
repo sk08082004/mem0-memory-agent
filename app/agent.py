@@ -70,6 +70,10 @@ Remember information such as:
 Do NOT remember information that is only temporary or useful
 for the immediate moment, unless it has additional long-term value.
 
+However, remember future events, meetings, appointments,
+deadlines, plans, and scheduled activities because they may be
+useful in future conversations even if they are time-sensitive.
+
 Do not invent information.
 Only extract information explicitly supported by the user's message.
 
@@ -145,6 +149,9 @@ User message:
 
             result = json.loads(response_text)
             memories = result.get("memories", [])
+
+            print("[DEBUG] Extracted memories:")
+            print(memories)
 
             if not memories:
                 return None
@@ -654,9 +661,28 @@ If there are no updates, return:
 
             for update in updates:
                 memory_id = update.get("memory_id")
+
+                old_memory = next(
+                    (
+                        memory
+                        for memory in candidate_memories
+                        if memory["id"] == memory_id
+                    ),
+                    None
+                )
+
+                old_memory_text = (
+                    old_memory.get("memory", "")
+                    if old_memory
+                    else ""
+                )
+
                 memory_text = update.get("text", "").strip()
                 importance = update.get("importance", 5)
-                reason = update.get("reason", "Updated based on the user's latest message.")
+                reason = update.get(
+                    "reason",
+                    "Updated based on the user's latest message."
+                )
 
                 # Never allow Gemini to modify a memory that was not
                 # provided as a candidate by our application.
@@ -668,7 +694,6 @@ If there are no updates, return:
 
                 try:
                     print(f"[MEMORY] Updating memory: {memory_id}")
-                    self.memory.delete(memory_id)
 
                     messages = [
                         {
@@ -677,18 +702,66 @@ If there are no updates, return:
                         }
                     ]
 
+                    old_metadata = old_memory.get("metadata", {}) if old_memory else {}
+                    old_evolution = old_metadata.get("evolution", {})
+
+                    history = []
+
+                    if isinstance(old_evolution, dict):
+                        existing_history = old_evolution.get("history", [])
+                        if isinstance(existing_history, list):
+                            history.extend(existing_history)
+
+                        if old_evolution.get("previous_memory"):
+                            history.insert(
+                                0,
+                                {
+                                    "memory_id": old_evolution.get("previous_memory_id"),
+                                    "from": old_evolution.get("previous_memory"),
+                                    "to": old_memory_text
+                                }
+                            )
+
+                    elif isinstance(old_evolution, str):
+                        try:
+                            parsed_evolution = json.loads(old_evolution)
+                            existing_history = parsed_evolution.get(
+                                "history", []
+                            )
+                            if isinstance(existing_history, list):
+                                history.extend(existing_history)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    history.append(
+                        {
+                            "memory_id": memory_id,
+                            "from": old_memory_text,
+                            "to": memory_text
+                        }
+                    )
+
                     self.memory.add(
                         messages,
                         self.user_id,
                         metadata={
                             "importance": importance,
                             "reason": reason,
-                            "source": "conversation"
+                            "source": "conversation",
+                            "evolution": json.dumps(
+                                {
+                                    "history": history
+                                }
+                            )
                         }
                     )
 
+                    # The previous version is now preserved inside the
+                    # current memory's evolution history, so it should no
+                    # longer appear as a separate active memory.
+                    self.memory.delete(memory_id)
+
                     print("[MEMORY] Memory updated successfully.")
-    
 
                     updated_any = True
 
@@ -889,6 +962,8 @@ User message:
         # Get relevant long-term memories.
         memories = self.recall(message)
 
+        print("[DEBUG] Recall results:")
+        print(memories)
         # Check every message for possible memory updates.
         # Mem0 finds likely related memories first, then Gemini decides
         # whether the new message actually changes any of them.
@@ -898,7 +973,7 @@ User message:
             candidate_memories = [
                 item
                 for item in memories["results"]
-                if item.get("score", 0) >= 0.35
+                if item.get("score", 0) >= 0.25
             ]
 
             candidate_memories = sorted(
@@ -906,6 +981,43 @@ User message:
                 key=lambda item: item.get("score", 0),
                 reverse=True
             )[:10]
+
+        # If semantic search does not return a strong enough candidate,
+        # fall back to the user's stored memories so Gemini can resolve
+        # short contextual updates such as "move it to 12".
+        if not candidate_memories:
+            try:
+                all_memories = self.memory.get_all(self.user_id)
+                if all_memories and "results" in all_memories:
+                    candidate_memories = all_memories["results"][:10]
+            except Exception as e:
+                print(f"[ERROR] Could not load memories for update analysis: {e}")
+
+        # Historical memories should not be updated again.
+        # If a candidate is referenced by another candidate's
+        # evolution metadata, it is an older version in that timeline.
+        historical_ids = set()
+
+        for item in candidate_memories:
+            evolution = item.get("metadata", {}).get("evolution", {})
+
+            if isinstance(evolution, dict):
+                previous_id = evolution.get("previous_memory_id")
+                if previous_id:
+                    historical_ids.add(previous_id)
+
+            elif isinstance(evolution, list):
+                for entry in evolution:
+                    if isinstance(entry, str) and entry.startswith(
+                        "previous_memory_id."
+                    ):
+                        historical_ids.add(entry.split(".", 1)[1])
+
+        candidate_memories = [
+            item
+            for item in candidate_memories
+            if item.get("id") not in historical_ids
+        ]
 
         was_updated = self.update_memory(message, candidate_memories)
 
@@ -918,10 +1030,49 @@ User message:
 
         if memories and "results" in memories:
 
+            # Historical versions belong to the evolution timeline and
+            # should not be treated as separate current memories.
+            historical_ids = set()
+
+            for item in memories["results"]:
+                evolution = item.get("metadata", {}).get("evolution")
+
+                if isinstance(evolution, str):
+                    try:
+                        evolution = json.loads(evolution)
+                    except (json.JSONDecodeError, TypeError):
+                        evolution = None
+
+                if isinstance(evolution, dict):
+                    previous_id = evolution.get("previous_memory_id")
+                    if previous_id:
+                        historical_ids.add(previous_id)
+
+                    history = evolution.get("history", [])
+                    if isinstance(history, list):
+                        for change in history:
+                            if isinstance(change, dict):
+                                memory_id = change.get("memory_id")
+                                if memory_id:
+                                    historical_ids.add(memory_id)
+
+                elif isinstance(evolution, list):
+                    for entry in evolution:
+                        if (
+                            isinstance(entry, str)
+                            and entry.startswith("previous_memory_id.")
+                        ):
+                            historical_ids.add(
+                                entry.split(".", 1)[1]
+                            )
+
             relevant_memories = [
                 item
                 for item in memories["results"]
-                if item.get("score", 0) >= 0.15
+                if (
+                    item.get("score", 0) >= 0.15
+                    and item.get("id") not in historical_ids
+                )
             ]
 
             # Combine semantic relevance, importance, and recency.
@@ -1069,7 +1220,11 @@ Answer naturally.
         # Store normal long-term information only when the message did not
         # update an existing memory. Updated memories have already been
         # replaced by update_memory().
-        if not was_updated and self.decide_memory(message):
+        should_remember = self.decide_memory(message)
+
+        print(f"[DEBUG] Should remember: {should_remember}")
+
+        if not was_updated and should_remember:
             self.remember(message, answer)
 
         return answer

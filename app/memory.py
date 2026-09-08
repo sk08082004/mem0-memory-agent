@@ -56,6 +56,13 @@ class MemoryManager:
 
         return results
 
+    def get_by_id(self, memory_id):
+        """
+        Get one specific memory by its ID.
+        """
+
+        return self.client.get(memory_id)
+
     def delete(self, memory_id):
         """
         Delete one memory.
@@ -63,19 +70,18 @@ class MemoryManager:
 
         return self.client.delete(memory_id)
 
-
     def clear(self, user_id):
-      """
-      Delete all memories belonging to a user.
-      """
+        """
+        Delete all memories belonging to a user.
+        """
 
-      memories = self.client.get_all(
-        filters={
-            "user_id": user_id
-           }
+        memories = self.client.get_all(
+            filters={
+                "user_id": user_id
+            }
         )
 
-      for memory in memories["results"]:
-        self.client.delete(memory["id"])
+        for memory in memories["results"]:
+            self.client.delete(memory["id"])
 
-      return True
+        return True
