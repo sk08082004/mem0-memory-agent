@@ -150,8 +150,7 @@ User message:
             result = json.loads(response_text)
             memories = result.get("memories", [])
 
-            print("[DEBUG] Extracted memories:")
-            print(memories)
+            
 
             if not memories:
                 return None
@@ -205,10 +204,10 @@ User message:
             )
 
             if "extraction" in locals():
-                print("[DEBUG] Gemini memory response:")
-                print(extraction.text)
 
-            return None
+
+
+             return None
 
     def deduplicate_memory(self, memory_text, importance, reason):
         """
@@ -531,12 +530,11 @@ Format when there is no duplicate:
             )
 
             if "response" in locals():
-                print("[DEBUG] Gemini deduplication response:")
-                print(response.text)
+                
 
             # If deduplication fails, allow the caller to store
             # the new memory normally.
-            return False
+             return False
 
     def recall(self, query):
         """
@@ -778,10 +776,9 @@ If there are no updates, return:
             )
 
             if "response" in locals():
-                print("[DEBUG] Gemini memory update response:")
-                print(response.text)
 
-            return False
+
+             return False
 
     def decide_memory(self, message):
         """
@@ -962,8 +959,6 @@ User message:
         # Get relevant long-term memories.
         memories = self.recall(message)
 
-        print("[DEBUG] Recall results:")
-        print(memories)
         # Check every message for possible memory updates.
         # Mem0 finds likely related memories first, then Gemini decides
         # whether the new message actually changes any of them.
@@ -1221,8 +1216,6 @@ Answer naturally.
         # update an existing memory. Updated memories have already been
         # replaced by update_memory().
         should_remember = self.decide_memory(message)
-
-        print(f"[DEBUG] Should remember: {should_remember}")
 
         if not was_updated and should_remember:
             self.remember(message, answer)
