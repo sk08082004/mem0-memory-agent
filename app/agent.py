@@ -37,6 +37,16 @@ class Agent:
         self.conversation_history = []
         self.max_history = 10
 
+    @staticmethod
+    def _normalize_confidence(value, default=0.5):
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return default
+
+        return max(0.0, min(confidence, 1.0))
+
+
     def remember(self, message, response):
         """
         Extract important long-term information from the user's message.
@@ -79,6 +89,12 @@ Only extract information explicitly supported by the user's message.
 
 For every memory, assign an importance score from 1 to 10.
 
+For every memory, also assign a confidence score from 0 to 1. 
+Confidence represent how certain the information is based on the  
+user's wording. Explicit and definitive statements should recieve higher 
+confidence, while uncertain, tentative or speculative statements 
+should recieve lower confidence. 
+
 Importance scale:
 
 1-3:
@@ -108,6 +124,7 @@ Return ONLY valid JSON in this exact format:
         {{
             "text": "standalone factual memory",
             "importance": 8,
+            "confidence": 0.95,
             "reason": "why this information is worth remembering"
         }}
     ]
@@ -160,6 +177,7 @@ User message:
             for memory in memories:
                 memory_text = memory.get("text", "").strip()
                 importance = memory.get("importance", 5)
+                confidence = self._normalize_confidence(memory.get("confidence", 0.5))
                 reason = memory.get("reason", "not specified")
 
                 if not memory_text:
@@ -170,7 +188,8 @@ User message:
                 was_deduplicated = self.deduplicate_memory(
                     memory_text,
                     importance,
-                    reason
+                    reason, 
+                    confidence
                 )
 
                 if was_deduplicated:
@@ -189,10 +208,14 @@ User message:
                     self.user_id,
                     metadata={
                         "importance": importance,
+                        "confidence": confidence,
                         "reason": reason,
                         "source": "conversation"
                     }
                 )
+
+               
+
 
                 stored_any = True
 
@@ -209,7 +232,7 @@ User message:
 
              return None
 
-    def deduplicate_memory(self, memory_text, importance, reason):
+    def deduplicate_memory(self, memory_text, importance, reason, confidence):
         """
         Check whether a newly extracted memory is a true duplicate
         of an existing memory.
@@ -243,6 +266,7 @@ User message:
 
             memory_list = "\n".join(
                 f"ID: {memory['id']} | Memory: {memory['memory']}"
+                f"Confidence: {memory.get('metadata', {}).get('confidence', 'N/A')}"
                 for memory in candidates
             )
 
@@ -406,6 +430,7 @@ Format when duplicate exists:
     "duplicate_memory_ids": ["existing-memory-id"],
     "merged_memory": "complete standalone memory",
     "importance": 8,
+    "confidence": 0.95,
     "reason": "why this memory is useful"
 }}
 
@@ -488,6 +513,11 @@ Format when there is no duplicate:
                 importance
             )
 
+            merged_confidence = self._normalize_confidence(
+                result.get("confidence", confidence), 
+                confidence
+            )
+
             merged_reason = result.get(
                 "reason",
                 "Merged from duplicate memories."
@@ -514,7 +544,8 @@ Format when there is no duplicate:
                 metadata={
                     "importance": merged_importance,
                     "reason": merged_reason,
-                    "source": "conversation"
+                    "source": "conversation",
+                    "confidence": merged_confidence
                 }
             )
 
@@ -567,6 +598,7 @@ Format when there is no duplicate:
         try:
             memory_list = "\n".join(
                 f"ID: {memory['id']} | Memory: {memory['memory']}"
+                f"Confidence: {memory.get('metadata', {}).get('confidence', 'N/A')}"
                 for memory in candidate_memories
             )
 
@@ -605,6 +637,8 @@ Rules:
 8. If nothing is changed, return an empty updates list.
 9. For every updated memory, provide an importance score from 1 to 10
    and a short reason based on the user's new message and the updated fact.
+10. For every updated memory, also provide a confidence score from 0 to 1
+    based on how certain the updated fact is supported by the user's message. 
 
 Return ONLY valid JSON in this exact format:
 
@@ -614,7 +648,8 @@ Return ONLY valid JSON in this exact format:
             "memory_id": "existing-memory-id",
             "text": "complete updated standalone memory",
             "importance": 8,
-            "reason": "why the updated information is worth remembering"
+            "reason": "why the updated information is worth remembering",
+            "confidence": 0.95
         }}
     ]
 }}
@@ -677,6 +712,7 @@ If there are no updates, return:
 
                 memory_text = update.get("text", "").strip()
                 importance = update.get("importance", 5)
+                confidence = self._normalize_confidence(update.get("confidence", 0.5))
                 reason = update.get(
                     "reason",
                     "Updated based on the user's latest message."
@@ -744,13 +780,14 @@ If there are no updates, return:
                         self.user_id,
                         metadata={
                             "importance": importance,
+                            "confidence": confidence,
                             "reason": reason,
                             "source": "conversation",
                             "evolution": json.dumps(
                                 {
                                     "history": history
                                 }
-                            )
+                            ),
                         }
                     )
 
@@ -1216,6 +1253,7 @@ Answer naturally.
         # update an existing memory. Updated memories have already been
         # replaced by update_memory().
         should_remember = self.decide_memory(message)
+
 
         if not was_updated and should_remember:
             self.remember(message, answer)

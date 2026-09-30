@@ -151,6 +151,10 @@ def main():
                     f"{metadata.get('importance', 'N/A')}"
                 )
                 print(
+                    f"confidence: "
+                    f"{metadata.get('confidence', 'N/A')}"
+                )
+                print(
                     f"Reason: "
                     f"{metadata.get('reason', 'N/A')}"
                 )
@@ -272,7 +276,7 @@ def main():
 
                 print(f"\nDeleting: {memory['memory']}")
 
-                agent.memory.delete(memory_id)
+                add_result = agent.memory.delete(memory_id)
 
                 print("Memory deleted.\n")
 
