@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 future*.txt
 session.json
-
+graph.json

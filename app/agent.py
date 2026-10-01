@@ -1,6 +1,10 @@
 import os
 import logging
 import json
+import traceback
+
+
+import time
 
 logging.getLogger("google").setLevel(logging.ERROR)
 
@@ -8,6 +12,7 @@ from google import genai
 from google.genai import types
 
 from app.memory import MemoryManager
+from app.graph import KnowledgeGraph
 
 
 class Agent:
@@ -18,7 +23,7 @@ class Agent:
     def __init__(self, user_id):
         self.user_id = user_id
         self.memory = MemoryManager()
-
+        self.graph = KnowledgeGraph()
         api_key = os.getenv("GEMINI_API_KEY")
 
         if not api_key:
@@ -30,7 +35,10 @@ class Agent:
         self.client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(
-                timeout=30000
+                timeout=30000, 
+                retry_options= types.HttpRetryOptions(
+                    attempts=1
+                )
             )
         )
 
@@ -147,6 +155,9 @@ User message:
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
                         disable=True
                     )
@@ -203,7 +214,7 @@ User message:
                     }
                 ]
 
-                self.memory.add(
+                add_result = self.memory.add(
                     messages,
                     self.user_id,
                     metadata={
@@ -214,8 +225,16 @@ User message:
                     }
                 )
 
-               
+                #Add the memory to the knowledge graph 
+                if add_result:
+                    graph_node_id = add_result.get("event_id")
 
+                    if graph_node_id: 
+                        self.graph.add_node(
+                            self.user_id, 
+                            graph_node_id,
+                            memory_text
+                        )
 
                 stored_any = True
 
@@ -225,6 +244,7 @@ User message:
             print(
                 f"\n[ERROR] Memory extraction/storage failed: {e}"
             )
+            traceback.print_exc()
 
             if "extraction" in locals():
 
@@ -443,12 +463,16 @@ Format when there is no duplicate:
     "reason": ""
 }}
 """
-
+            
             response = self.client.models.generate_content(
+
                 model="gemini-3.5-flash-lite",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
                         disable=True
                     )
@@ -660,12 +684,14 @@ If there are no updates, return:
     "updates": []
 }}
 """
-
             response = self.client.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
                         disable=True
                     )
@@ -963,6 +989,9 @@ User message:
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
                         disable=True
                     )
@@ -1234,12 +1263,16 @@ Answer naturally.
         response = self.client.models.generate_content(
             model="gemini-3.5-flash-lite",
             contents=system_prompt,
-            config=types.GenerateContentConfig(
+            config=types.GenerateContentConfig(     
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                ),
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=True
                 )
             )
         )
+
 
         answer = response.text
 
