@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+from platform import node
 import traceback
 
 
@@ -236,6 +237,11 @@ User message:
                             memory_text
                         )
 
+                        self.create_memory_relationships(
+                            graph_node_id, 
+                            memory_text
+                        )
+
                 stored_any = True
 
             return stored_any
@@ -251,6 +257,117 @@ User message:
 
 
              return None
+
+    def create_memory_relationships(self, memory_id, memory_text):
+        """
+        Find meaningful relationships between the new memory and existing memories
+        in the user's knowledge graph. Store the relationships in the graph for
+        future reference.
+        """
+
+        try:
+            user_graph = self.graph.get_user_graph(self.user_id)
+
+            existing_nodes = [
+                node
+                for node in user_graph.get("nodes", [])
+                if node["id"] != memory_id
+            ]
+
+            # Nothing to connect to.
+            if not existing_nodes:
+                return
+
+            # Keep the prompt reasonably small.
+            existing_nodes = existing_nodes[:10]
+
+            memory_list = "\n".join(
+                f"ID: {node['id']} | Memory: {node['memory_text']}"
+                for node in existing_nodes
+            )
+
+            prompt = f"""
+    You are a knowledge graph relationship analyzer.
+
+    NEW MEMORY:
+    "{memory_text}"
+
+    EXISTING MEMORIES:
+    {memory_list}
+
+    Determine whether the NEW MEMORY has a meaningful semantic
+    relationship with any EXISTING MEMORY.
+
+    Rules:
+    - Use semantic understanding, not keyword matching.
+    - Same topic alone is NOT enough.
+    - Create a relationship only when the connection is meaningful.
+    - Do not invent information.
+    - One new memory may have zero, one, or multiple relationships.
+    - Prefer simple relationship names such as:
+    prefers, uses, works_with, related_to, plans,
+    studies, lives_in, interested_in, motivated_by
+    - If there is no meaningful relationship, return an empty list.
+
+    Return ONLY valid JSON:
+
+    {{
+        "relationships": [
+            {{
+                "target_id": "existing-memory-id",
+                "relationship": "relationship_name"
+            }}
+        ]
+    }}
+    """
+
+            start_time = time.time()
+
+            response = self.client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
+                )
+            )
+
+            print(
+                f"[TIME] graph relationship Gemini: "
+                f"{time.time() - start_time:.2f}s"
+            )
+
+            result = json.loads(response.text)
+
+            valid_ids = {
+                node["id"]
+                for node in existing_nodes
+            }
+
+            for item in result.get("relationships", []):
+                target_id = item.get("target_id")
+                relationship = item.get("relationship")
+
+                if (
+                    target_id in valid_ids
+                    and relationship
+                ):
+                    self.graph.add_relationship(
+                        self.user_id,
+                        memory_id,
+                        target_id,
+                        relationship
+                    )
+
+        except Exception as e:
+            print(
+                f"[GRAPH] Relationship creation failed: {e}"
+            )
 
     def deduplicate_memory(self, memory_text, importance, reason, confidence):
         """
@@ -650,6 +767,28 @@ Rules:
 1. Return an update only when the new message clearly changes,
    corrects, replaces, or modifies an existing memory.
 2. Do not treat a merely related message as an update.
+
+IMPORTANT:
+A new fact that adds a different detail about the same topic is NOT an update.
+
+For example:
+
+Existing:
+"User enjoys photography."
+
+New:
+"User uses Lightroom to edit travel photos."
+
+Result:
+NO UPDATE.
+
+Reason:
+The new message adds information about a tool and activity.
+It does not change whether the user enjoys photography.
+
+Only update an existing memory when the new message changes
+the actual fact expressed by that memory.
+
 3. Resolve references such as "that", "it", "the meeting", or "the old one"
    using the existing memories when the meaning is clear.
 4. When a memory is updated, rewrite it as a complete standalone factual
