@@ -117,6 +117,170 @@ def main():
 
             continue
 
+        # show knowledge graph
+        if user_input.lower() == "/graph":
+            try:
+                memories = agent.memory.get_all(agent.user_id)
+
+                agent.graph.sync_user_graph(
+                    agent.user_id,
+                    memories
+                )
+
+                user_graph = agent.graph.get_user_graph(
+                    agent.user_id
+                )
+
+                user_graph = agent.graph.get_user_graph(agent.user_id)
+
+                nodes = user_graph.get("nodes", [])
+                relationships = user_graph.get("relationships", [])
+
+                print("\nKnowledge Graph:")
+                print(f"Nodes: {len(nodes)}")
+                print(f"Relationships: {len(relationships)}")
+
+                if not nodes:
+                    print("No nodes in the graph.")
+                    continue
+
+                    # create a number for each memory
+                    node_number = {}
+
+                    print("\nMemories:")
+
+                    for i, memory in enumerate(
+                        memories["results"],
+                        start=1
+                    ):
+                        node_number[memory["id"]] = i
+                        print(f"{i}. {memory['memory']}")
+
+                if relationships:
+                    print("\nRelationships:")
+
+                    for relationship in relationships:
+                        source_number = node_number.get(
+                            relationship["source"],
+                            "?"
+                        )
+
+                        target_number = node_number.get(
+                            relationship["target"],
+                            "?"
+                        )
+
+                        print(
+                            f"{source_number} --"
+                            f"{relationship['relationship']}--> "
+                            f"{target_number}"
+                        )
+
+                else:
+                    print("\nNo relationships in the graph.")
+
+                print()
+
+            except Exception as e:
+                print(
+                    f"\n[ERROR] Could not retrieve knowledge graph: {e}\n"
+                )
+
+            continue
+
+
+        # show memories related to a specific memory
+        if user_input.lower().startswith("/related"):
+            parts = user_input.split()
+
+            if len(parts) != 2:
+                print("\nUsage: /related <memory_number>\n")
+                continue
+
+            try:
+                memory_number = int(parts[1])
+            except ValueError:
+                print("\nPlease enter a valid memory number.\n")
+                continue
+
+            try:
+                # Get the current Mem0 memories
+                memories = agent.memory.get_all(agent.user_id)
+
+                # Synchronize the graph with Mem0
+                agent.graph.sync_user_graph(
+                    agent.user_id,
+                    memories
+                )
+
+                user_graph = agent.graph.get_user_graph(
+                    agent.user_id
+                )
+
+                nodes = user_graph.get("nodes", [])
+                relationships = user_graph.get("relationships", [])
+
+                if memory_number < 1 or memory_number > len(nodes):
+                    print("\nInvalid memory number.\n")
+                    continue
+
+                selected_node = nodes[memory_number - 1]
+                selected_id = selected_node["id"]
+
+                print(
+                    f"\nMemories related to: "
+                    f"{selected_node['memory_text']}"
+                )
+
+                print("\nRelated memories:")
+
+                found = False
+
+                for relationship in relationships:
+
+                    if relationship["source"] == selected_id:
+                        related_id = relationship["target"]
+
+                    elif relationship["target"] == selected_id:
+                        related_id = relationship["source"]
+
+                    else:
+                        continue
+
+                    related_node = next(
+                        (
+                            node
+                            for node in nodes
+                            if node["id"] == related_id
+                        ),
+                        None
+                    )
+
+                    if related_node:
+                        found = True
+
+                        print(
+                            f"- {related_node['memory_text']}"
+                        )
+
+                        print(
+                            f"  Relationship: "
+                            f"{relationship['relationship']}"
+                        )
+
+                if not found:
+                    print("No related memories found.")
+
+                print()
+
+            except Exception as e:
+                print(
+                    f"\n[ERROR] Could not retrieve related memories: {e}\n"
+                )
+
+            continue
+
+
         # Show detailed information about a memory
         if user_input.lower().startswith("/memory-info"):
             parts = user_input.split()
@@ -278,6 +442,11 @@ def main():
 
                 add_result = agent.memory.delete(memory_id)
 
+                agent.graph.delete_node(
+                agent.user_id,
+                memory_id
+)
+
                 print("Memory deleted.\n")
 
             except Exception as e:
@@ -328,6 +497,7 @@ Available commands:
 
 /memories              View all stored memories.
 /memory-info <num>     Show detailed memory provenance.
+/graph                 View the knowledge graph. 
 /forget <num>          Delete a specific memory.
 /clear                 Delete all memories.
 /new                   Start a new conversation.

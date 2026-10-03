@@ -55,6 +55,52 @@ class Agent:
 
         return max(0.0, min(confidence, 1.0))
 
+    def get_memory_id(self, event_id, attempts=30, delay=1):
+        """
+        Wait for a Mem0 add event to finish
+        and return the actual memory ID.
+        """
+
+        for _ in range(attempts):
+            try:
+                response = self.memory.get_event(event_id)
+
+                if response.status_code != 200:
+                    time.sleep(delay)
+                    continue
+
+                event = response.json()
+                status = event.get("status")
+
+                if status == "SUCCEEDED":
+                    results = event.get("results", [])
+
+                    if isinstance(results, list):
+                        for item in results:
+                            if isinstance(item, dict):
+                                memory_id = item.get("id")
+
+                                if memory_id:
+                                    return memory_id
+
+                    return None
+
+                if status == "FAILED":
+                    print(
+                        f"[GRAPH] Mem0 event failed: "
+                        f"{event.get('error', 'Unknown error')}"
+                    )
+                    return None
+
+            except Exception as e:
+                print(
+                    f"[GRAPH] Could not retrieve Mem0 event: {e}"
+                )
+
+            time.sleep(delay)
+
+        print("[GRAPH] Timed out waiting for Mem0 event.")
+        return None
 
     def remember(self, message, response):
         """
@@ -226,19 +272,20 @@ User message:
                     }
                 )
 
-                #Add the memory to the knowledge graph 
+                    # Add the memory to the knowledge graph
                 if add_result:
-                    graph_node_id = add_result.get("event_id")
+                    print(f"[GRAPH] Add result: {add_result}")
 
-                    if graph_node_id: 
+                    graph_node_id = self.get_memory_id(
+                    add_result.get("event_id")
+                    )
+
+                    print(f"[GRAPH] Found memory ID: {graph_node_id}")
+
+                    if graph_node_id:
                         self.graph.add_node(
-                            self.user_id, 
+                            self.user_id,
                             graph_node_id,
-                            memory_text
-                        )
-
-                        self.create_memory_relationships(
-                            graph_node_id, 
                             memory_text
                         )
 
@@ -671,6 +718,21 @@ Format when there is no duplicate:
                 )
                 self.memory.delete(memory_id)
 
+            # Remove the duplicate memories.
+            for duplicate_id in duplicate_ids:
+                print(
+                    f"[MEMORY] Removing duplicate memory: {duplicate_id}"
+                )
+
+                self.memory.delete(duplicate_id)
+
+                # Also remove the duplicate from the knowledge graph.
+                self.graph.delete_node(
+                    self.user_id,
+                    duplicate_id
+                )
+
+
             # Store the merged memory.
             messages = [
                 {
@@ -679,16 +741,34 @@ Format when there is no duplicate:
                 }
             ]
 
-            self.memory.add(
+            add_result = self.memory.add(
                 messages,
                 self.user_id,
                 metadata={
                     "importance": merged_importance,
+                    "confidence": merged_confidence,
                     "reason": merged_reason,
-                    "source": "conversation",
-                    "confidence": merged_confidence
+                    "source": "conversation"
                 }
             )
+
+            # Add the merged memory to the knowledge graph.
+            if add_result:
+                merged_memory_id = self.get_memory_id(
+                add_result.get("event_id")
+                )
+
+                if merged_memory_id:
+                    self.graph.add_node(
+                        self.user_id,
+                        merged_memory_id,
+                        merged_memory
+                    )
+
+                    self.create_memory_relationships(
+                        merged_memory_id,
+                        merged_memory
+                    )
 
             print(
                 "[MEMORY] Duplicate memories merged successfully."
@@ -940,7 +1020,7 @@ If there are no updates, return:
                         }
                     )
 
-                    self.memory.add(
+                    new_add_result = self.memory.add(
                         messages,
                         self.user_id,
                         metadata={
@@ -953,13 +1033,37 @@ If there are no updates, return:
                                     "history": history
                                 }
                             ),
-                        }
+                        },
                     )
 
-                    # The previous version is now preserved inside the
-                    # current memory's evolution history, so it should no
-                    # longer appear as a separate active memory.
+                    # Get the actual ID of the newly created Mem0 memory.
+                    new_memory_id = None
+
+                    if new_add_result:
+                        new_memory_id = self.get_memory_id(
+                        new_add_result.get("event_id")
+                        )
+
+                    # Delete the old Mem0 memory.
                     self.memory.delete(memory_id)
+
+                    # Keep the knowledge graph synchronized.
+                    self.graph.delete_node(
+                        self.user_id,
+                        memory_id
+                    )
+
+                    if new_memory_id:
+                        self.graph.add_node(
+                            self.user_id,
+                            new_memory_id,
+                            memory_text
+                        )
+
+                        self.create_memory_relationships(
+                            new_memory_id,
+                            memory_text
+                        )
 
                     print("[MEMORY] Memory updated successfully.")
 
@@ -1425,6 +1529,8 @@ Answer naturally.
         # update an existing memory. Updated memories have already been
         # replaced by update_memory().
         should_remember = self.decide_memory(message)
+
+        print(f"[DEBUG] Should remember: {should_remember}")
 
 
         if not was_updated and should_remember:

@@ -29,6 +29,15 @@ class MemoryManager:
 
         return result
 
+    def get_event(self, event_id):
+       """
+       Get the status of a Mem0 background event.
+       """
+
+       return self.client.client.get(
+            f"/v1/event/{event_id}/"
+       )
+
     def search(self, query, user_id):
         """
         Search the user's long-term memories.
