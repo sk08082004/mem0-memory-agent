@@ -17,9 +17,10 @@ from app.graph import KnowledgeGraph
 
 
 class Agent:
-    """
-    AI agent with long-term memory.
-    """
+    """AI agent with long-term memory."""
+
+    RELATIONSHIP_RECOVERY_BATCH_LIMIT = 5
+    RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT = 3
 
     def __init__(self, user_id):
         self.user_id = user_id
@@ -460,7 +461,7 @@ User message:
                     print(
                         f"[MEMORY] Mem0 memory {graph_node_id} and its graph "
                         "node were stored, but relationship persistence failed; "
-                        "graph synchronization or retry is needed."
+                        "inspect /recover-relationships."
                     )
 
                 stored_any = True
@@ -487,36 +488,74 @@ User message:
         """
 
         try:
-            user_graph = self.graph.get_user_graph(self.user_id)
-            graph_nodes = user_graph.get("nodes", [])
-            if not any(node.get("id") == memory_id for node in graph_nodes):
-                raise ValueError(
-                    "The new memory is not present in the user's graph."
+            if not self.graph.create_relationship_recovery(
+                self.user_id,
+                memory_id
+            ):
+                user_graph = self.graph.graph.get(self.user_id, {})
+                queue = (
+                    user_graph.get(self.graph.RELATIONSHIP_RECOVERY_KEY, {})
+                    if isinstance(user_graph, dict)
+                    else {}
                 )
+                if isinstance(queue, dict) and len(queue) >= (
+                    self.graph.MAX_RECOVERY_RECORDS
+                ):
+                    reason = (
+                        "the recovery queue is full; unresolved records "
+                        "were preserved"
+                    )
+                else:
+                    reason = "recovery tracking could not be recorded"
+                print(
+                    f"[GRAPH] {reason} for {memory_id}; generation was not "
+                    "started."
+                )
+                return False
 
-            existing_nodes = [
-                node
-                for node in graph_nodes
-                if node["id"] != memory_id
-            ]
-
-            # Nothing to connect to.
-            if not existing_nodes:
-                return True
-
-            # Keep the prompt reasonably small.
-            existing_nodes = existing_nodes[:10]
-
-            memory_list = "\n".join(
-                f"ID: {node['id']} | Memory: {node['memory_text']}"
-                for node in existing_nodes
+            return self._generate_tracked_relationships(
+                memory_id,
+                self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT
             )
+        except Exception as e:
+            print(
+                f"[GRAPH] Relationship recovery tracking failed for "
+                f"{memory_id}; generation was not started: {e}"
+            )
+            return False
 
-            prompt = f"""
+    def _generate_relationship_edges(self, memory_id):
+        user_graph = self.graph.get_user_graph(self.user_id)
+        graph_nodes = user_graph.get("nodes", [])
+        source = next(
+            (
+                node for node in graph_nodes
+                if isinstance(node, dict) and node.get("id") == memory_id
+            ),
+            None
+        )
+        if source is None:
+            raise ValueError("The source memory is not present in the user's graph.")
+
+        existing_nodes = [
+            node
+            for node in graph_nodes
+            if isinstance(node, dict) and node.get("id") != memory_id
+        ][:10]
+
+        if not existing_nodes:
+            return []
+
+        memory_list = "\n".join(
+            f"ID: {node['id']} | Memory: {node['memory_text']}"
+            for node in existing_nodes
+        )
+
+        prompt = f"""
     You are a knowledge graph relationship analyzer.
 
     NEW MEMORY:
-    "{memory_text}"
+    "{source['memory_text']}"
 
     EXISTING MEMORIES:
     {memory_list}
@@ -547,80 +586,402 @@ User message:
     }}
     """
 
-            start_time = time.time()
-
-            response = self.client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    )
+        start_time = time.time()
+        response = self.client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
                 )
             )
+        )
+        print(
+            f"[TIME] graph relationship Gemini: "
+            f"{time.time() - start_time:.2f}s"
+        )
 
-            print(
-                f"[TIME] graph relationship Gemini: "
-                f"{time.time() - start_time:.2f}s"
+        result = json.loads(response.text)
+        if (
+            not isinstance(result, dict)
+            or not isinstance(result.get("relationships"), list)
+        ):
+            raise ValueError(
+                "Relationship response must contain a relationships list."
             )
 
-            result = json.loads(response.text)
+        valid_ids = {
+            node.get("id")
+            for node in existing_nodes
+            if isinstance(node.get("id"), str)
+        }
+        relationships = []
+        for item in result["relationships"]:
+            if not isinstance(item, dict):
+                raise ValueError("Relationship entries must be objects.")
+
+            target_id = item.get("target_id")
+            relationship = item.get("relationship")
             if (
-                not isinstance(result, dict)
-                or not isinstance(result.get("relationships"), list)
+                not isinstance(target_id, str)
+                or not target_id.strip()
+                or target_id not in valid_ids
+                or not isinstance(relationship, str)
+                or not relationship.strip()
             ):
                 raise ValueError(
-                    "Relationship response must contain a relationships list."
+                    "Relationship entry contains invalid endpoints or label."
                 )
-
-            valid_ids = {
-                node["id"]
-                for node in existing_nodes
+            edge = {
+                "target_id": target_id,
+                "relationship": relationship,
             }
+            if edge not in relationships:
+                relationships.append(edge)
 
-            relationships = []
-            for item in result["relationships"]:
-                if not isinstance(item, dict):
-                    raise ValueError(
-                        "Relationship entries must be objects."
-                    )
+        if len(relationships) > self.graph.MAX_EXPECTED_EDGES:
+            raise ValueError("Relationship response exceeds the edge limit.")
+        return relationships
 
-                target_id = item.get("target_id")
-                relationship = item.get("relationship")
-                if (
-                    not isinstance(target_id, str)
-                    or not target_id.strip()
-                    or target_id not in valid_ids
-                    or not isinstance(relationship, str)
-                    or not relationship.strip()
-                ):
-                    raise ValueError(
-                        "Relationship entry contains invalid endpoints or label."
-                    )
-                relationships.append((target_id, relationship))
-
-            for target_id, relationship in relationships:
-                if not self.graph.add_relationship(
-                    self.user_id,
-                    memory_id,
-                    target_id,
-                    relationship
-                ):
-                    raise ValueError(
-                        f"Graph rejected relationship to memory {target_id}."
-                    )
-
-            return True
-
-        except Exception as e:
+    def _generate_tracked_relationships(self, memory_id, attempt_limit):
+        attempt = self.graph.begin_relationship_attempt(
+            self.user_id,
+            memory_id,
+            attempt_limit
+        )
+        if attempt["status"] != "ready":
             print(
-                f"[GRAPH] Relationship creation failed: {e}"
+                f"[GRAPH] Relationship generation for {memory_id} was not "
+                f"started: {attempt['status']}."
             )
             return False
+
+        try:
+            edges = self._generate_relationship_edges(memory_id)
+        except Exception as e:
+            try:
+                self.graph.set_relationship_recovery_status(
+                    self.user_id,
+                    memory_id,
+                    "failed",
+                    str(e)
+                )
+            except Exception as save_error:
+                print(
+                    f"[GRAPH] Generation failed for {memory_id}, and failure "
+                    f"status could not be saved: {save_error}"
+                )
+            print(
+                f"[GRAPH] Relationship generation failed for {memory_id}: {e}"
+            )
+            return False
+
+        if not edges:
+            try:
+                if not self.graph.finish_empty_relationship_recovery(
+                    self.user_id,
+                    memory_id
+                ):
+                    raise ValueError("Could not confirm empty-result status.")
+                return True
+            except Exception as e:
+                print(
+                    f"[GRAPH] Empty relationship result for {memory_id} was "
+                    f"not durably recorded: {e}"
+                )
+                return False
+
+        try:
+            if not self.graph.set_pending_relationship_edges(
+                self.user_id,
+                memory_id,
+                edges
+            ):
+                raise ValueError("Could not persist expected relationship edges.")
+            result = self.graph.complete_relationship_recovery(
+                self.user_id,
+                memory_id
+            )
+            if result["status"] == "blocked_missing_endpoint":
+                self.graph.set_relationship_recovery_status(
+                    self.user_id,
+                    memory_id,
+                    "blocked_missing_endpoint",
+                    "A source or target node no longer exists."
+                )
+                return False
+            return result["status"] == "succeeded"
+        except Exception as e:
+            print(
+                f"[GRAPH] Relationship persistence remains pending for "
+                f"{memory_id}: {e}"
+            )
+            return False
+
+    def recover_relationships(
+        self,
+        dry_run=True,
+        batch_limit=RELATIONSHIP_RECOVERY_BATCH_LIMIT,
+        attempt_limit=RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT
+    ):
+        if type(batch_limit) is not int or batch_limit < 1:
+            raise ValueError("batch_limit must be a positive integer.")
+        if type(attempt_limit) is not int or attempt_limit < 1:
+            raise ValueError("attempt_limit must be a positive integer.")
+        batch_limit = min(batch_limit, self.RELATIONSHIP_RECOVERY_BATCH_LIMIT)
+        attempt_limit = min(
+            attempt_limit,
+            self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT
+        )
+        recovery = self.graph.get_relationship_recovery(self.user_id)
+        report = {
+            "dry_run": dry_run,
+            "batch_limit": batch_limit,
+            "attempted": 0,
+            "succeeded": 0,
+            "succeeded_empty": 0,
+            "pending": 0,
+            "failed": 0,
+            "blocked": 0,
+            "capped": [],
+            "eligible": [],
+            "invalid_records": recovery["invalid_records"],
+            "queue_size": recovery["queue_size"],
+            "remaining": 0,
+            "details": [],
+        }
+
+        if not recovery["valid"]:
+            report["error"] = recovery["error"]
+            report["blocked"] = recovery["blocked_count"]
+            return report
+
+        current_user_graph = self.graph.graph.get(self.user_id, {})
+        graph_nodes = (
+            current_user_graph.get("nodes", [])
+            if isinstance(current_user_graph, dict)
+            else []
+        )
+        node_ids = {
+            node.get("id")
+            for node in graph_nodes
+            if (
+                isinstance(node, dict)
+                and isinstance(node.get("id"), str)
+                and node["id"].strip()
+            )
+        }
+        eligible = []
+        for record in recovery["records"]:
+            status = record["status"]
+            source_id = record["source_id"]
+            if status in {"succeeded", "succeeded_empty"}:
+                continue
+            if status == "blocked_missing_endpoint":
+                report["blocked"] += 1
+                report["details"].append(
+                    {"source_id": source_id, "status": status, "reason": record.get("error")}
+                )
+                continue
+            if source_id not in node_ids:
+                report["blocked"] += 1
+                report["details"].append(
+                    {
+                        "source_id": source_id,
+                        "status": "blocked_missing_endpoint",
+                        "reason": "Source node is missing.",
+                    }
+                )
+                if not dry_run:
+                    try:
+                        self.graph.set_relationship_recovery_status(
+                            self.user_id,
+                            source_id,
+                            "blocked_missing_endpoint",
+                            "Source node is missing."
+                        )
+                    except Exception as e:
+                        report["details"][-1]["reason"] = str(e)
+                continue
+            expected = record.get("expected_edges", [])
+            missing_target = (
+                status == "pending_persistence"
+                and (
+                    not isinstance(expected, list)
+                    or any(
+                        not isinstance(edge, dict)
+                        or edge.get("target_id") not in node_ids
+                        for edge in expected
+                    )
+                )
+            )
+            if missing_target:
+                report["blocked"] += 1
+                report["details"].append(
+                    {
+                        "source_id": source_id,
+                        "status": "blocked_missing_endpoint",
+                        "reason": "One or more target nodes are missing.",
+                    }
+                )
+                if not dry_run:
+                    try:
+                        self.graph.set_relationship_recovery_status(
+                            self.user_id,
+                            source_id,
+                            "blocked_missing_endpoint",
+                            "One or more target nodes are missing."
+                        )
+                    except Exception as e:
+                        report["details"][-1]["reason"] = str(e)
+                continue
+            if status not in {"pending_generation", "failed", "pending_persistence"}:
+                report["blocked"] += 1
+                report["details"].append(
+                    {
+                        "source_id": source_id,
+                        "status": "blocked_invalid_record",
+                        "reason": "Unsupported recovery status.",
+                    }
+                )
+                continue
+            if (
+                status in {"pending_generation", "failed"}
+                and record["attempts"] >= attempt_limit
+            ):
+                report["capped"].append(source_id)
+                continue
+            eligible.append(record)
+
+        report["eligible"] = [record["source_id"] for record in eligible]
+        report["remaining"] = max(0, len(eligible) - batch_limit)
+        if dry_run:
+            report["pending"] = len(eligible)
+            report["blocked"] += len(report["invalid_records"])
+            return report
+
+        for record in eligible[:batch_limit]:
+            source_id = record["source_id"]
+            report["attempted"] += 1
+            status = record["status"]
+            try:
+                if status == "pending_persistence":
+                    result = self.graph.complete_relationship_recovery(
+                        self.user_id,
+                        source_id
+                    )
+                    if result["status"] == "succeeded":
+                        report["succeeded"] += 1
+                        report["details"].append(
+                            {"source_id": source_id, "status": "succeeded"}
+                        )
+                    elif result["status"] == "blocked_missing_endpoint":
+                        reason = "A source or target node is missing."
+                        self.graph.set_relationship_recovery_status(
+                            self.user_id,
+                            source_id,
+                            "blocked_missing_endpoint",
+                            reason
+                        )
+                        report["blocked"] += 1
+                        report["details"].append(
+                            {
+                                "source_id": source_id,
+                                "status": "blocked",
+                                "reason": reason,
+                            }
+                        )
+                    else:
+                        report["pending"] += 1
+                        report["details"].append(
+                            {
+                                "source_id": source_id,
+                                "status": "pending",
+                                "reason": "Expected edges could not be persisted.",
+                            }
+                        )
+                else:
+                    was_successful = self._generate_tracked_relationships(
+                        source_id,
+                        attempt_limit
+                    )
+                    updated = self.graph.get_relationship_recovery(
+                        self.user_id
+                    )
+                    refreshed = next(
+                        (
+                            item for item in updated["records"]
+                            if item["source_id"] == source_id
+                        ),
+                        None
+                    )
+                    if was_successful and refreshed:
+                        if refreshed["status"] == "succeeded_empty":
+                            report["succeeded_empty"] += 1
+                            report["details"].append(
+                                {
+                                    "source_id": source_id,
+                                    "status": "succeeded-empty",
+                                }
+                            )
+                        else:
+                            report["succeeded"] += 1
+                            report["details"].append(
+                                {"source_id": source_id, "status": "succeeded"}
+                            )
+                    elif refreshed and refreshed["status"] == "failed":
+                        report["failed"] += 1
+                        report["details"].append(
+                            {
+                                "source_id": source_id,
+                                "status": "failed",
+                                "reason": refreshed.get("error") or
+                                    "Relationship generation failed.",
+                            }
+                        )
+                    elif (
+                        refreshed
+                        and refreshed["status"] == "blocked_missing_endpoint"
+                    ):
+                        report["blocked"] += 1
+                        report["details"].append(
+                            {
+                                "source_id": source_id,
+                                "status": "blocked",
+                                "reason": refreshed.get("error") or
+                                    "A source or target node is missing.",
+                            }
+                        )
+                    else:
+                        report["pending"] += 1
+                        report["details"].append(
+                            {
+                                "source_id": source_id,
+                                "status": "pending",
+                                "reason": (
+                                    refreshed.get("error")
+                                    if refreshed
+                                    else "Recovery status could not be confirmed."
+                                ),
+                            }
+                        )
+            except Exception as e:
+                report["pending"] += 1
+                report["details"].append(
+                    {
+                        "source_id": source_id,
+                        "status": "pending",
+                        "reason": str(e)[:self.graph.MAX_RECOVERY_ERROR_LENGTH],
+                    }
+                )
+
+        report["pending"] += report["remaining"]
+        report["blocked"] += recovery["blocked_count"]
+        return report
 
     def deduplicate_memory(self, memory_text, importance, reason, confidence):
         """

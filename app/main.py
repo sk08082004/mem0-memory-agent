@@ -175,6 +175,75 @@ def main():
 
             continue
 
+        if user_input.lower() in {
+            "/recover-relationships",
+            "/recover-relationships --apply",
+        }:
+            apply_recovery = user_input.lower().endswith("--apply")
+            try:
+                report = agent.recover_relationships(
+                    dry_run=not apply_recovery
+                )
+                if not apply_recovery:
+                    print("\nRelationship recovery preview (dry run):")
+                    print(f"Eligible source IDs: {report['eligible']}")
+                    print(f"Capped source IDs: {report['capped']}")
+                    print(f"Blocked records: {report['blocked']}")
+                    for detail in report["details"]:
+                        if detail["status"] == "blocked_missing_endpoint":
+                            print(
+                                f"- {detail['source_id']}: "
+                                f"{detail.get('reason', 'Missing endpoint.')}"
+                            )
+                    if report["invalid_records"]:
+                        print(
+                            f"Invalid preserved records: "
+                            f"{report['invalid_records']}"
+                        )
+                    print(f"Remaining eligible work: {report['remaining']}")
+                    print(f"Batch limit: {report['batch_limit']}")
+                    if report.get("error"):
+                        print(f"Queue error: {report['error']}")
+                    print("No changes were made.\n")
+                else:
+                    print("\nRelationship recovery results:")
+                    for key in (
+                        "attempted",
+                        "succeeded",
+                        "succeeded_empty",
+                        "pending",
+                        "failed",
+                        "blocked",
+                    ):
+                        print(f"{key.replace('_', ' ').title()}: {report[key]}")
+                    for detail in report["details"]:
+                        print(
+                            f"- {detail['source_id']}: {detail['status']}"
+                            + (
+                                f" ({detail['reason']})"
+                                if detail.get("reason")
+                                else ""
+                            )
+                        )
+                    if report["capped"]:
+                        print(f"Capped source IDs: {report['capped']}")
+                    if report["invalid_records"]:
+                        print(
+                            f"Invalid preserved records: "
+                            f"{report['invalid_records']}"
+                        )
+                    if report.get("error"):
+                        print(f"Recovery queue error: {report['error']}")
+                    if report["remaining"]:
+                        print(
+                            f"Eligible records beyond this batch: "
+                            f"{report['remaining']}"
+                        )
+                    print()
+            except Exception as e:
+                print(f"\n[ERROR] Relationship recovery failed: {e}\n")
+            continue
+
         # show knowledge graph
         if user_input.lower() == "/graph":
             try:
@@ -617,6 +686,7 @@ Available commands:
 /memories              View all stored memories.
 /memory-info <num>     Show detailed memory provenance.
 /graph                 View the knowledge graph. 
+/recover-relationships Preview relationship recovery; append --apply to apply.
 /forget <num>          Delete a specific memory.
 /clear                 Delete all memories.
 /new                   Start a new conversation.

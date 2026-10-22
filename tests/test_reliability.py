@@ -63,8 +63,10 @@ class FakeResponse:
 class FakeModels:
     def __init__(self, responses):
         self.responses = list(responses)
+        self.calls = 0
 
     def generate_content(self, **kwargs):
+        self.calls += 1
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -106,6 +108,9 @@ class FakeMemory:
 
 
 class FakeGraph:
+    MAX_EXPECTED_EDGES = 10
+    MAX_RECOVERY_ERROR_LENGTH = 240
+
     def __init__(self, node_error=None, relationship_result=True):
         self.nodes = []
         self.edges = []
@@ -113,6 +118,7 @@ class FakeGraph:
         self.node_error = node_error
         self.relationship_result = relationship_result
         self.sync_calls = []
+        self.recovery = {}
 
     def add_node(self, user_id, memory_id, memory_text):
         if self.node_error:
@@ -155,6 +161,93 @@ class FakeGraph:
 
     def sync_user_graph(self, user_id, memories):
         self.sync_calls.append((user_id, copy.deepcopy(memories)))
+
+    def create_relationship_recovery(self, user_id, source_id):
+        if not any(
+            node["user_id"] == user_id and node["id"] == source_id
+            for node in self.nodes
+        ):
+            return False
+        self.recovery.setdefault(
+            (user_id, source_id),
+            {
+                "source_id": source_id,
+                "status": "pending_generation",
+                "attempts": 0,
+                "error": None,
+                "expected_edges": [],
+            },
+        )
+        return True
+
+    def begin_relationship_attempt(self, user_id, source_id, max_attempts=3):
+        record = self.recovery.get((user_id, source_id))
+        if not record:
+            return {"status": "invalid", "record": None}
+        if record["attempts"] >= max_attempts:
+            return {"status": "capped", "record": record}
+        record["attempts"] += 1
+        record["status"] = "pending_generation"
+        return {"status": "ready", "record": copy.deepcopy(record)}
+
+    def set_relationship_recovery_status(
+        self,
+        user_id,
+        source_id,
+        status,
+        error=None,
+    ):
+        record = self.recovery.get((user_id, source_id))
+        if not record:
+            return False
+        record["status"] = status
+        record["error"] = error
+        if status != "pending_persistence":
+            record["expected_edges"] = []
+        return True
+
+    def set_pending_relationship_edges(self, user_id, source_id, edges):
+        record = self.recovery.get((user_id, source_id))
+        if not record:
+            return False
+        record["status"] = "pending_persistence"
+        record["expected_edges"] = copy.deepcopy(edges)
+        return True
+
+    def complete_relationship_recovery(self, user_id, source_id):
+        record = self.recovery.get((user_id, source_id))
+        if not record:
+            return {"status": "invalid"}
+        for edge in record["expected_edges"]:
+            if not self.add_relationship(
+                user_id,
+                source_id,
+                edge["target_id"],
+                edge["relationship"],
+            ):
+                return {"status": "failed"}
+        record["status"] = "succeeded"
+        record["expected_edges"] = []
+        return {"status": "succeeded"}
+
+    def finish_empty_relationship_recovery(self, user_id, source_id):
+        return self.set_relationship_recovery_status(
+            user_id,
+            source_id,
+            "succeeded_empty",
+        )
+
+    def get_relationship_recovery(self, user_id):
+        return {
+            "valid": True,
+            "records": [
+                copy.deepcopy(record)
+                for (record_user, _), record in self.recovery.items()
+                if record_user == user_id
+            ],
+            "invalid_records": [],
+            "error": None,
+        }
 
 
 def make_agent():
@@ -993,6 +1086,528 @@ class KnowledgeGraphTests(unittest.TestCase):
             self.assertEqual(graph_file.read(), original_contents)
 
 
+class RelationshipRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.path = os.path.join(self.temp_dir.name, "graph.json")
+        self.graph = KnowledgeGraph(self.path)
+        self.agent = Agent.__new__(Agent)
+        self.agent.user_id = "user-a"
+        self.agent.graph = self.graph
+        self.agent.memory = types.SimpleNamespace(
+            add=self._forbidden_mem0,
+            delete=self._forbidden_mem0,
+            get_all=self._forbidden_mem0,
+            get_all_complete=self._forbidden_mem0,
+            search=self._forbidden_mem0,
+            clear=self._forbidden_mem0,
+        )
+
+    @staticmethod
+    def _forbidden_mem0(*args, **kwargs):
+        raise AssertionError("Relationship recovery must not call Mem0.")
+
+    @staticmethod
+    def relationship_response(target_id="target", relationship="related_to"):
+        return json.dumps(
+            {
+                "relationships": [
+                    {
+                        "target_id": target_id,
+                        "relationship": relationship,
+                    }
+                ]
+            }
+        )
+
+    def add_source_and_target(self, source="source", target="target"):
+        self.graph.add_node("user-a", source, "Source memory")
+        self.graph.add_node("user-a", target, "Target memory")
+
+    @staticmethod
+    def pending_record(source_id):
+        return {
+            "source_id": source_id,
+            "status": "pending_generation",
+            "attempts": 0,
+            "error": None,
+            "expected_edges": [],
+        }
+
+    def write_recovery_queue(self, size):
+        queue = {
+            f"source-{index}": self.pending_record(f"source-{index}")
+            for index in range(size)
+        }
+        with open(self.path, "w", encoding="utf-8") as graph_file:
+            json.dump(
+                {
+                    "user-a": {
+                        "nodes": [],
+                        "relationships": [],
+                        "relationship_recovery": queue,
+                    }
+                },
+                graph_file,
+            )
+        self.graph = KnowledgeGraph(self.path)
+        self.agent.graph = self.graph
+        return queue
+
+    def test_apply_reports_successful_source_and_outcome(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([self.relationship_response()])
+        )
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertIn(
+            {"source_id": "source", "status": "succeeded"},
+            report["details"],
+        )
+
+    def test_apply_reports_failed_source_and_reason(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([RuntimeError("synthetic generation failure")])
+        )
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["failed"], 1)
+        failure = next(
+            detail for detail in report["details"]
+            if detail["source_id"] == "source"
+        )
+        self.assertEqual(failure["status"], "failed")
+        self.assertIn("synthetic generation failure", failure["reason"])
+
+    def test_exactly_200_recovery_records_are_valid(self):
+        expected_queue = self.write_recovery_queue(200)
+        recovery = self.graph.get_relationship_recovery("user-a")
+        self.assertTrue(recovery["valid"])
+        self.assertEqual(recovery["queue_size"], 200)
+        self.assertEqual(len(recovery["records"]), 200)
+        self.assertEqual(len(expected_queue), 200)
+
+    def test_oversized_recovery_queue_is_reported_and_preserved(self):
+        expected_queue = self.write_recovery_queue(201)
+        before = copy.deepcopy(self.graph.graph)
+        recovery = self.graph.get_relationship_recovery("user-a")
+        self.assertFalse(recovery["valid"])
+        self.assertEqual(recovery["queue_size"], 201)
+        self.assertEqual(recovery["blocked_count"], 201)
+        self.assertIn("exceeding the limit of 200", recovery["error"])
+        self.assertEqual(
+            self.graph.graph["user-a"]["relationship_recovery"],
+            expected_queue,
+        )
+        self.assertEqual(self.graph.graph, before)
+
+    def test_oversized_queue_apply_does_not_call_model_or_mutate(self):
+        expected_queue = self.write_recovery_queue(201)
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["blocked"], 201)
+        self.assertEqual(report["attempted"], 0)
+        self.assertIn("exceeding the limit of 200", report["error"])
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(self.graph.graph, before_graph)
+        self.assertEqual(
+            self.graph.graph["user-a"]["relationship_recovery"],
+            expected_queue,
+        )
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_nonempty_generation_persists_edges_with_success_status(self):
+        self.add_source_and_target()
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([self.relationship_response()])
+        )
+        saves = []
+        original_save = self.graph.save
+
+        def capture_save(graph=None):
+            if graph is not None:
+                saves.append(copy.deepcopy(graph))
+            return original_save(graph)
+
+        with patch.object(self.graph, "save", side_effect=capture_save):
+            self.assertTrue(
+                self.agent.create_memory_relationships("source", "Source memory")
+            )
+
+        final_user_graph = saves[-1]["user-a"]
+        self.assertEqual(
+            final_user_graph["relationships"],
+            [
+                {
+                    "source": "source",
+                    "target": "target",
+                    "relationship": "related_to",
+                }
+            ],
+        )
+        self.assertEqual(
+            final_user_graph["relationship_recovery"]["source"]["status"],
+            "succeeded",
+        )
+        self.assertEqual(
+            final_user_graph["relationship_recovery"]["source"]["expected_edges"],
+            [],
+        )
+
+    def test_empty_generation_is_terminal_and_not_retried(self):
+        self.add_source_and_target()
+        models = FakeModels(['{"relationships": []}'])
+        self.agent.client = types.SimpleNamespace(models=models)
+        self.assertTrue(self.agent.create_memory_relationships("source", "Source memory"))
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"][0]["status"],
+            "succeeded_empty",
+        )
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["attempted"], 0)
+        self.assertEqual(models.calls, 1)
+
+    def test_model_failure_and_malformed_output_remain_retryable(self):
+        for response in (
+            RuntimeError("temporary model failure"),
+            '{"relationships": [null]}',
+            "{}",
+        ):
+            with self.subTest(response=response):
+                self.graph = KnowledgeGraph(
+                    os.path.join(self.temp_dir.name, f"{len(os.listdir(self.temp_dir.name))}.json")
+                )
+                self.agent.graph = self.graph
+                self.add_source_and_target()
+                self.agent.client = types.SimpleNamespace(
+                    models=FakeModels([response])
+                )
+                self.assertFalse(
+                    self.agent.create_memory_relationships(
+                        "source",
+                        "Source memory",
+                    )
+                )
+                record = self.graph.get_relationship_recovery("user-a")["records"][0]
+                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["attempts"], 1)
+                self.assertEqual(record["expected_edges"], [])
+
+    def test_final_graph_save_failure_keeps_durable_pending_edges(self):
+        self.add_source_and_target()
+        self.assertTrue(self.graph.create_relationship_recovery("user-a", "source"))
+        self.graph.begin_relationship_attempt("user-a", "source")
+        self.graph.set_pending_relationship_edges(
+            "user-a",
+            "source",
+            [{"target_id": "target", "relationship": "related_to"}],
+        )
+        with open(self.path, "rb") as graph_file:
+            durable_before = graph_file.read()
+        before = copy.deepcopy(self.graph.graph)
+        with patch("app.graph.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                self.graph.complete_relationship_recovery("user-a", "source")
+        self.assertEqual(self.graph.graph, before)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), durable_before)
+        record = self.graph.get_relationship_recovery("user-a")["records"][0]
+        self.assertEqual(record["status"], "pending_persistence")
+        self.assertEqual(len(record["expected_edges"]), 1)
+
+    def test_missing_source_is_blocked_without_model_call(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.delete_node("user-a", "source")
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["blocked"], 1)
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"][0]["status"],
+            "blocked_missing_endpoint",
+        )
+
+    def test_missing_target_is_blocked_without_creating_edge(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.begin_relationship_attempt("user-a", "source")
+        self.graph.set_pending_relationship_edges(
+            "user-a",
+            "source",
+            [{"target_id": "target", "relationship": "related_to"}],
+        )
+        self.graph.delete_node("user-a", "target")
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["blocked"], 1)
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["relationships"],
+            [],
+        )
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"][0]["status"],
+            "blocked_missing_endpoint",
+        )
+
+    def test_cross_user_endpoint_is_rejected(self):
+        self.graph.add_node("user-a", "source", "Source")
+        self.graph.add_node("user-b", "target", "Other user's target")
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.begin_relationship_attempt("user-a", "source")
+        record = self.graph.get_user_graph("user-a")[
+            "relationship_recovery"
+        ]["source"]
+        record["status"] = "pending_persistence"
+        record["expected_edges"] = [
+            {"target_id": "target", "relationship": "related_to"}
+        ]
+        self.graph.save()
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["blocked"], 1)
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"][0]["status"],
+            "blocked_missing_endpoint",
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["relationships"],
+            [],
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-b")["relationships"],
+            [],
+        )
+
+    def test_failed_generation_can_be_retried_with_next_bounded_attempt(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([RuntimeError("temporary failure")])
+        )
+        first_report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(first_report["failed"], 1)
+        first_record = self.graph.get_relationship_recovery("user-a")["records"][0]
+        self.assertEqual(first_record["status"], "failed")
+        self.assertEqual(first_record["attempts"], 1)
+
+        self.agent.client.models.responses.append('{"relationships": []}')
+        second_report = self.agent.recover_relationships(dry_run=False)
+        second_record = self.graph.get_relationship_recovery("user-a")["records"][0]
+        self.assertEqual(second_report["succeeded_empty"], 1)
+        self.assertEqual(second_record["status"], "succeeded_empty")
+        self.assertEqual(second_record["attempts"], 2)
+
+    def test_duplicate_edge_retry_is_idempotent(self):
+        self.add_source_and_target()
+        self.graph.add_relationship("user-a", "source", "target", "related_to")
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.begin_relationship_attempt("user-a", "source")
+        self.graph.set_pending_relationship_edges(
+            "user-a",
+            "source",
+            [{"target_id": "target", "relationship": "related_to"}],
+        )
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertEqual(
+            len(self.graph.get_user_graph("user-a")["relationships"]),
+            1,
+        )
+
+    def test_dry_run_has_no_model_graph_or_file_mutations(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=AssertionError("dry-run attempted a save"),
+        ):
+            report = self.agent.recover_relationships(dry_run=True)
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(self.graph.graph, before_graph)
+        self.assertEqual(report["eligible"], ["source"])
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_attempt_limit_prevents_model_calls_after_restart(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        for _ in range(3):
+            self.assertEqual(
+                self.graph.begin_relationship_attempt(
+                    "user-a",
+                    "source",
+                    max_attempts=3,
+                )["status"],
+                "ready",
+            )
+        self.graph.set_relationship_recovery_status(
+            "user-a",
+            "source",
+            "failed",
+            "retryable failure",
+        )
+        restarted_graph = KnowledgeGraph(self.path)
+        self.agent.graph = restarted_graph
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["capped"], ["source"])
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(
+            restarted_graph.get_relationship_recovery("user-a")["records"][0]["attempts"],
+            3,
+        )
+
+    def test_batch_limit_is_enforced(self):
+        for index in range(7):
+            source = f"source-{index}"
+            target = f"target-{index}"
+            self.add_source_and_target(source, target)
+            self.graph.create_relationship_recovery("user-a", source)
+        models = FakeModels(['{"relationships": []}'] * 5)
+        self.agent.client = types.SimpleNamespace(models=models)
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["attempted"], 5)
+        self.assertEqual(models.calls, 5)
+        self.assertEqual(report["remaining"], 2)
+
+    def test_recovery_is_user_scoped_and_does_not_call_mem0(self):
+        self.add_source_and_target()
+        self.graph.add_node("user-b", "b-source", "B source")
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.create_relationship_recovery("user-b", "b-source")
+        before_b = copy.deepcopy(self.graph.graph["user-b"])
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels(['{"relationships": []}'])
+        )
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["succeeded_empty"], 1)
+        self.assertEqual(self.graph.graph["user-b"], before_b)
+
+    def test_sync_preserves_recovery_records_unknown_fields_and_malformed_entries(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.graph["user-a"]["custom_legacy"] = {"keep": True}
+        self.graph.graph["user-a"]["relationship_recovery"]["broken"] = {
+            "status": "unknown",
+            "legacy": ["preserve"],
+        }
+        self.graph.sync_user_graph(
+            "user-a",
+            {"count": 1, "results": [{"id": "source", "memory": "Source"}]},
+        )
+        user_graph = self.graph.get_user_graph("user-a")
+        self.assertEqual(user_graph["custom_legacy"], {"keep": True})
+        self.assertIn("broken", user_graph["relationship_recovery"])
+        self.assertEqual(
+            user_graph["relationship_recovery"]["source"]["status"],
+            "pending_generation",
+        )
+        report = self.graph.get_relationship_recovery("user-a")
+        self.assertEqual(report["invalid_records"], ["broken"])
+
+    def test_queue_capacity_never_evicts_unresolved_records(self):
+        self.add_source_and_target("source-1", "target-1")
+        self.add_source_and_target("source-2", "target-2")
+        self.add_source_and_target("source-3", "target-3")
+        with patch.object(KnowledgeGraph, "MAX_RECOVERY_RECORDS", 2):
+            self.assertTrue(
+                self.graph.create_relationship_recovery("user-a", "source-1")
+            )
+            self.assertTrue(
+                self.graph.create_relationship_recovery("user-a", "source-2")
+            )
+            self.assertFalse(
+                self.graph.create_relationship_recovery("user-a", "source-3")
+            )
+        records = self.graph.get_relationship_recovery("user-a")["records"]
+        self.assertEqual({record["source_id"] for record in records}, {"source-1", "source-2"})
+
+    def test_full_queue_is_reported_without_model_call_or_eviction(self):
+        self.add_source_and_target("source-1", "target-1")
+        self.add_source_and_target("source-2", "target-2")
+        self.add_source_and_target("source-3", "target-3")
+        with patch.object(KnowledgeGraph, "MAX_RECOVERY_RECORDS", 2):
+            self.graph.create_relationship_recovery("user-a", "source-1")
+            self.graph.create_relationship_recovery("user-a", "source-2")
+            models = FakeModels(['{"relationships": []}'])
+            self.agent.client = types.SimpleNamespace(models=models)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(
+                    self.agent.create_memory_relationships(
+                        "source-3",
+                        "Third source",
+                    )
+                )
+        self.assertIn("queue is full", output.getvalue())
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(
+            {
+                record["source_id"]
+                for record in self.graph.get_relationship_recovery("user-a")["records"]
+            },
+            {"source-1", "source-2"},
+        )
+
+    def test_failed_initial_tracking_write_does_not_call_model(self):
+        self.add_source_and_target()
+        models = FakeModels(['{"relationships": []}'])
+        self.agent.client = types.SimpleNamespace(models=models)
+        with patch.object(self.graph, "save", side_effect=OSError("disk full")):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(
+                    self.agent.create_memory_relationships(
+                        "source",
+                        "Source memory",
+                    )
+                )
+        self.assertEqual(models.calls, 0)
+        self.assertIn("generation was not started", output.getvalue())
+        self.assertNotIn("relationship_recovery", self.graph.graph["user-a"])
+
+    def test_recovery_attempt_increment_is_durable_before_generation(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        original_generate = self.agent._generate_relationship_edges
+
+        def check_attempt_before_call(source_id):
+            record = self.graph.get_relationship_recovery("user-a")["records"][0]
+            self.assertEqual(record["attempts"], 1)
+            self.assertEqual(record["status"], "pending_generation")
+            return original_generate(source_id)
+
+        self.agent._generate_relationship_edges = check_attempt_before_call
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels(['{"relationships": []}'])
+        )
+        report = self.agent.recover_relationships(dry_run=False)
+        self.assertEqual(report["succeeded_empty"], 1)
+
+    def test_malformed_recovery_records_are_reported_and_preserved(self):
+        self.add_source_and_target()
+        user_graph = self.graph.get_user_graph("user-a")
+        user_graph["relationship_recovery"] = ["malformed legacy queue"]
+        before = copy.deepcopy(self.graph.graph)
+        report = self.agent.recover_relationships(dry_run=True)
+        self.assertEqual(report["blocked"], 1)
+        self.assertEqual(self.graph.graph, before)
+
+
 class CliAndSessionTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1023,6 +1638,50 @@ class CliAndSessionTests(unittest.TestCase):
         with open(self.session_path, "w", encoding="utf-8") as file:
             json.dump({"user_id": "  user-a  "}, file)
         self.assertEqual(load_user(), "user-a")
+
+    def test_relationship_recovery_cli_defaults_to_dry_run(self):
+        calls = []
+
+        class FakeAgent:
+            def __init__(self, user_id):
+                self.user_id = user_id
+                self.memory = types.SimpleNamespace()
+                self.graph = types.SimpleNamespace()
+
+            def recover_relationships(self, dry_run=True):
+                calls.append(dry_run)
+                return {
+                    "dry_run": dry_run,
+                    "batch_limit": 5,
+                    "attempted": 1 if not dry_run else 0,
+                    "succeeded": 1 if not dry_run else 0,
+                    "succeeded_empty": 0,
+                    "pending": 0,
+                    "failed": 0,
+                    "blocked": 0,
+                    "capped": [],
+                    "eligible": ["source"],
+                    "invalid_records": [],
+                    "remaining": 0,
+                    "details": [],
+                }
+
+        with patch.object(main_module, "Agent", FakeAgent), patch.object(
+            main_module, "load_user", return_value="user-a"
+        ):
+            commands = iter(
+                ["/recover-relationships", "/recover-relationships --apply", "exit"]
+            )
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(calls, [True, False])
+        self.assertIn("No changes were made", output.getvalue())
+        self.assertIn("Relationship recovery results", output.getvalue())
 
     def test_save_rejects_blank_ids_and_persistence_failure_preserves_file(self):
         for value in ("", "  ", None, 2):

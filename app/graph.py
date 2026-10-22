@@ -6,6 +6,20 @@ import threading
 
 
 class KnowledgeGraph:
+    RELATIONSHIP_RECOVERY_KEY = "relationship_recovery"
+    MAX_RECOVERY_RECORDS = 200
+    MAX_RECOVERY_ATTEMPTS = 3
+    MAX_EXPECTED_EDGES = 10
+    MAX_RECOVERY_ERROR_LENGTH = 240
+    RECOVERY_STATUSES = {
+        "pending_generation",
+        "pending_persistence",
+        "succeeded",
+        "succeeded_empty",
+        "failed",
+        "blocked_missing_endpoint",
+    }
+
     def __init__(self, file_path="graph.json"):
         self.path_file = file_path
         self._lock = threading.RLock()
@@ -58,6 +72,343 @@ class KnowledgeGraph:
         updated_graph[user_id] = user_graph
         self.save(updated_graph)
         self.graph = updated_graph
+
+    @staticmethod
+    def _valid_recovery_record(record):
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("source_id"), str)
+            or not record["source_id"].strip()
+            or len(record["source_id"]) > 256
+            or record.get("status") not in KnowledgeGraph.RECOVERY_STATUSES
+            or type(record.get("attempts")) is not int
+            or not 0 <= record["attempts"] <= KnowledgeGraph.MAX_RECOVERY_ATTEMPTS
+            or not isinstance(record.get("error"), (str, type(None)))
+            or (
+                isinstance(record.get("error"), str)
+                and len(record["error"]) > KnowledgeGraph.MAX_RECOVERY_ERROR_LENGTH
+            )
+            or not isinstance(record.get("expected_edges"), list)
+            or len(record["expected_edges"]) > KnowledgeGraph.MAX_EXPECTED_EDGES
+        ):
+            return False
+
+        for edge in record["expected_edges"]:
+            if (
+                not isinstance(edge, dict)
+                or not isinstance(edge.get("target_id"), str)
+                or not edge["target_id"].strip()
+                or len(edge["target_id"]) > 256
+                or not isinstance(edge.get("relationship"), str)
+                or not edge["relationship"].strip()
+                or len(edge["relationship"]) > 256
+            ):
+                return False
+        if (
+            record["status"] == "pending_persistence"
+            and not record["expected_edges"]
+        ):
+            return False
+        if (
+            record["status"] in {"pending_generation", "failed", "succeeded", "succeeded_empty"}
+            and record["expected_edges"]
+        ):
+            return False
+        return True
+
+    def _user_graph_copy(self, user_id):
+        current = self.graph.get(
+            user_id,
+            {
+                "nodes": [],
+                "relationships": []
+            }
+        )
+        if (
+            not isinstance(current, dict)
+            or not isinstance(current.get("nodes"), list)
+            or not isinstance(current.get("relationships"), list)
+        ):
+            raise ValueError("Cannot update an invalid user graph.")
+        return copy.deepcopy(current)
+
+    @staticmethod
+    def _node_ids(user_graph):
+        return {
+            node.get("id")
+            for node in user_graph["nodes"]
+            if (
+                isinstance(node, dict)
+                and isinstance(node.get("id"), str)
+                and node["id"].strip()
+            )
+        }
+
+    def get_relationship_recovery(self, user_id):
+        with self._lock:
+            user_graph = self.graph.get(user_id, {})
+            if not isinstance(user_graph, dict):
+                return {
+                    "valid": False,
+                    "records": [],
+                    "invalid_records": [str(user_graph)],
+                    "blocked_count": 1,
+                    "queue_size": 0,
+                    "error": "User graph is malformed.",
+                }
+
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY, {})
+            if not isinstance(queue, dict):
+                return {
+                    "valid": False,
+                    "records": [],
+                    "invalid_records": [str(queue)[:self.MAX_RECOVERY_ERROR_LENGTH]],
+                    "blocked_count": 1,
+                    "queue_size": 0,
+                    "error": "Relationship recovery queue is malformed.",
+                }
+            if len(queue) > self.MAX_RECOVERY_RECORDS:
+                queue_size = len(queue)
+                return {
+                    "valid": False,
+                    "records": [],
+                    "invalid_records": [],
+                    "blocked_count": queue_size,
+                    "queue_size": queue_size,
+                    "error": (
+                        f"Relationship recovery queue has {queue_size} records, "
+                        f"exceeding the limit of {self.MAX_RECOVERY_RECORDS}. "
+                        "No records were changed or processed. Review and resolve "
+                        "records manually before retrying recovery."
+                    ),
+                }
+
+            records = []
+            invalid_records = []
+            for source_id, record in queue.items():
+                if not self._valid_recovery_record(record) or source_id != record.get(
+                    "source_id"
+                ):
+                    invalid_records.append(str(source_id))
+                    continue
+                records.append(copy.deepcopy(record))
+
+            return {
+                "valid": True,
+                "records": records,
+                "invalid_records": invalid_records,
+                "blocked_count": len(invalid_records),
+                "queue_size": len(queue),
+                "error": None,
+            }
+
+    def create_relationship_recovery(self, user_id, source_id):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or not isinstance(source_id, str)
+            or not source_id.strip()
+            or len(source_id) > 256
+        ):
+            return False
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            if source_id not in self._node_ids(user_graph):
+                return False
+
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY, {})
+            if not isinstance(queue, dict):
+                return False
+            if source_id in queue:
+                return self._valid_recovery_record(queue[source_id])
+            if len(queue) >= self.MAX_RECOVERY_RECORDS:
+                return False
+
+            queue[source_id] = {
+                "source_id": source_id,
+                "status": "pending_generation",
+                "attempts": 0,
+                "error": None,
+                "expected_edges": [],
+            }
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
+            self._commit_user_graph(user_id, user_graph)
+            return True
+
+    def begin_relationship_attempt(
+        self,
+        user_id,
+        source_id,
+        max_attempts=MAX_RECOVERY_ATTEMPTS
+    ):
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer.")
+        max_attempts = min(max_attempts, self.MAX_RECOVERY_ATTEMPTS)
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            record = queue.get(source_id) if isinstance(queue, dict) else None
+            if not self._valid_recovery_record(record):
+                return {"status": "invalid", "record": None}
+            if source_id not in self._node_ids(user_graph):
+                return {"status": "blocked_missing_endpoint", "record": record}
+            if record["status"] not in {"pending_generation", "failed"}:
+                return {"status": "not_eligible", "record": copy.deepcopy(record)}
+            if record["attempts"] >= max_attempts:
+                return {"status": "capped", "record": copy.deepcopy(record)}
+
+            record["attempts"] += 1
+            record["status"] = "pending_generation"
+            record["error"] = None
+            queue[source_id] = record
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
+            self._commit_user_graph(user_id, user_graph)
+            return {"status": "ready", "record": copy.deepcopy(record)}
+
+    def set_relationship_recovery_status(
+        self,
+        user_id,
+        source_id,
+        status,
+        error=None
+    ):
+        if status not in self.RECOVERY_STATUSES:
+            raise ValueError("Unsupported relationship recovery status.")
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            record = queue.get(source_id) if isinstance(queue, dict) else None
+            if not self._valid_recovery_record(record):
+                return False
+
+            if (
+                status == "pending_persistence"
+                and not record["expected_edges"]
+            ):
+                return False
+            record["status"] = status
+            record["error"] = (
+                str(error)[:self.MAX_RECOVERY_ERROR_LENGTH]
+                if error
+                else None
+            )
+            if status in {"succeeded", "succeeded_empty"}:
+                record["expected_edges"] = []
+            queue[source_id] = record
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
+            self._commit_user_graph(user_id, user_graph)
+            return True
+
+    def set_pending_relationship_edges(self, user_id, source_id, edges):
+        if (
+            not isinstance(edges, list)
+            or not edges
+            or len(edges) > self.MAX_EXPECTED_EDGES
+            or any(
+                not isinstance(edge, dict)
+                or not isinstance(edge.get("target_id"), str)
+                or not edge["target_id"].strip()
+                or len(edge["target_id"]) > 256
+                or not isinstance(edge.get("relationship"), str)
+                or not edge["relationship"].strip()
+                or len(edge["relationship"]) > 256
+                for edge in edges
+            )
+        ):
+            return False
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            record = queue.get(source_id) if isinstance(queue, dict) else None
+            if (
+                not self._valid_recovery_record(record)
+                or record["status"] not in {"pending_generation", "failed"}
+            ):
+                return False
+
+            node_ids = self._node_ids(user_graph)
+            if source_id not in node_ids or any(
+                edge["target_id"] not in node_ids for edge in edges
+            ):
+                return False
+
+            record["status"] = "pending_persistence"
+            record["error"] = None
+            record["expected_edges"] = [
+                {
+                    "target_id": edge["target_id"],
+                    "relationship": edge["relationship"],
+                }
+                for edge in edges
+            ]
+            queue[source_id] = record
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
+            self._commit_user_graph(user_id, user_graph)
+            return True
+
+    def complete_relationship_recovery(self, user_id, source_id):
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            record = queue.get(source_id) if isinstance(queue, dict) else None
+            if (
+                not self._valid_recovery_record(record)
+                or record["status"] != "pending_persistence"
+                or not isinstance(record.get("expected_edges"), list)
+                or len(record["expected_edges"]) > self.MAX_EXPECTED_EDGES
+            ):
+                return {"status": "invalid"}
+
+            node_ids = self._node_ids(user_graph)
+            if source_id not in node_ids or any(
+                not isinstance(edge, dict)
+                or not isinstance(edge.get("target_id"), str)
+                or not edge["target_id"].strip()
+                or edge.get("target_id") not in node_ids
+                or not isinstance(edge.get("relationship"), str)
+                or not edge["relationship"].strip()
+                for edge in record["expected_edges"]
+            ):
+                return {"status": "blocked_missing_endpoint"}
+
+            relationships = user_graph["relationships"]
+            for edge in record["expected_edges"]:
+                candidate = {
+                    "source": source_id,
+                    "target": edge["target_id"],
+                    "relationship": edge["relationship"],
+                }
+                if candidate not in relationships:
+                    relationships.append(candidate)
+
+            record["status"] = "succeeded"
+            record["error"] = None
+            record["expected_edges"] = []
+            queue[source_id] = record
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
+            self._commit_user_graph(user_id, user_graph)
+            return {"status": "succeeded"}
+
+    def finish_empty_relationship_recovery(self, user_id, source_id):
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            record = queue.get(source_id) if isinstance(queue, dict) else None
+            if (
+                not self._valid_recovery_record(record)
+                or record["status"] not in {"pending_generation", "failed"}
+            ):
+                return False
+            record["status"] = "succeeded_empty"
+            record["error"] = None
+            record["expected_edges"] = []
+            queue[source_id] = record
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
+            self._commit_user_graph(user_id, user_graph)
+            return True
 
     def get_user_graph(self, user_id):
         return self.graph.setdefault(
@@ -281,5 +632,31 @@ class KnowledgeGraph:
             updated_user_graph = copy.deepcopy(user_graph)
             updated_user_graph["nodes"] = current_nodes
             updated_user_graph["relationships"] = valid_relationships
+            recovery = updated_user_graph.get(
+                self.RELATIONSHIP_RECOVERY_KEY
+            )
+            if isinstance(recovery, dict):
+                current_ids = set(current_memories)
+                for source_id, record in recovery.items():
+                    if not self._valid_recovery_record(record):
+                        continue
+                    expected_edges = record.get("expected_edges", [])
+                    has_missing_target = (
+                        isinstance(expected_edges, list)
+                        and any(
+                            isinstance(edge, dict)
+                            and edge.get("target_id") not in current_ids
+                            for edge in expected_edges
+                        )
+                    )
+                    if (
+                        source_id not in current_ids
+                        or has_missing_target
+                    ):
+                        record["status"] = "blocked_missing_endpoint"
+                        record["error"] = (
+                            "A source or target memory is absent from the "
+                            "current complete listing."
+                        )[:self.MAX_RECOVERY_ERROR_LENGTH]
 
             self._commit_user_graph(user_id, updated_user_graph)
