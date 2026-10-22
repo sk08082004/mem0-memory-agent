@@ -16,6 +16,7 @@ class KnowledgeGraph:
         "pending_persistence",
         "succeeded",
         "succeeded_empty",
+        "superseded",
         "failed",
         "blocked_missing_endpoint",
     }
@@ -110,8 +111,19 @@ class KnowledgeGraph:
         ):
             return False
         if (
-            record["status"] in {"pending_generation", "failed", "succeeded", "succeeded_empty"}
+            record["status"] in {
+                "pending_generation",
+                "failed",
+                "succeeded",
+                "succeeded_empty",
+            }
             and record["expected_edges"]
+        ):
+            return False
+        if record["status"] == "superseded" and (
+            not isinstance(record.get("replacement_id"), str)
+            or not record["replacement_id"].strip()
+            or len(record["replacement_id"]) > 256
         ):
             return False
         return True
@@ -275,6 +287,10 @@ class KnowledgeGraph:
     ):
         if status not in self.RECOVERY_STATUSES:
             raise ValueError("Unsupported relationship recovery status.")
+        if status == "superseded":
+            raise ValueError(
+                "Superseded status requires a confirmed replacement ID."
+            )
 
         with self._lock:
             user_graph = self._user_graph_copy(user_id)
@@ -547,6 +563,111 @@ class KnowledgeGraph:
 
             self._commit_user_graph(user_id, user_graph)
 
+    def reconcile_memory_replacement(
+        self,
+        user_id,
+        old_memory_id,
+        replacement_id,
+        replacement_text,
+    ):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or not isinstance(old_memory_id, str)
+            or not old_memory_id.strip()
+            or not isinstance(replacement_id, str)
+            or not replacement_id.strip()
+            or not isinstance(replacement_text, str)
+            or not replacement_text.strip()
+        ):
+            raise ValueError("Memory replacement details are invalid.")
+
+        reason = (
+            f"Source memory was replaced by {replacement_id}; "
+            "relationships were not redirected."
+        )[:self.MAX_RECOVERY_ERROR_LENGTH]
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            if old_memory_id != replacement_id:
+                user_graph["nodes"] = [
+                    node
+                    for node in user_graph["nodes"]
+                    if not (
+                        isinstance(node, dict)
+                        and node.get("id") == old_memory_id
+                    )
+                ]
+                user_graph["relationships"] = [
+                    edge
+                    for edge in user_graph["relationships"]
+                    if not (
+                        isinstance(edge, dict)
+                        and (
+                            edge.get("source") == old_memory_id
+                            or edge.get("target") == old_memory_id
+                        )
+                    )
+                ]
+
+            replacement_node = next(
+                (
+                    node for node in user_graph["nodes"]
+                    if isinstance(node, dict)
+                    and node.get("id") == replacement_id
+                ),
+                None,
+            )
+            if replacement_node is None:
+                user_graph["nodes"].append(
+                    {
+                        "id": replacement_id,
+                        "memory_text": replacement_text,
+                    }
+                )
+            else:
+                replacement_node["memory_text"] = replacement_text
+
+            blocked_sources = []
+            superseded = False
+            recovery = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            if isinstance(recovery, dict) and old_memory_id != replacement_id:
+                old_record = recovery.get(old_memory_id)
+                if (
+                    self._valid_recovery_record(old_record)
+                    and old_record.get("source_id") == old_memory_id
+                ):
+                    old_record["status"] = "superseded"
+                    old_record["replacement_id"] = replacement_id
+                    old_record["error"] = reason
+                    superseded = True
+
+                for source_id, record in recovery.items():
+                    if (
+                        source_id == old_memory_id
+                        or not self._valid_recovery_record(record)
+                        or record["status"] not in {
+                            "pending_generation",
+                            "pending_persistence",
+                            "failed",
+                        }
+                    ):
+                        continue
+                    expected_edges = record.get("expected_edges", [])
+                    if any(
+                        edge.get("target_id") == old_memory_id
+                        for edge in expected_edges
+                    ):
+                        record["status"] = "blocked_missing_endpoint"
+                        record["error"] = reason
+                        blocked_sources.append(source_id)
+
+            self._commit_user_graph(user_id, user_graph)
+            return {
+                "superseded": superseded,
+                "blocked_sources": blocked_sources,
+            }
+
     def sync_user_graph(
         self,
         user_id,
@@ -639,6 +760,12 @@ class KnowledgeGraph:
                 current_ids = set(current_memories)
                 for source_id, record in recovery.items():
                     if not self._valid_recovery_record(record):
+                        continue
+                    if record["status"] in {
+                        "succeeded",
+                        "succeeded_empty",
+                        "superseded",
+                    }:
                         continue
                     expected_edges = record.get("expected_edges", [])
                     has_missing_target = (

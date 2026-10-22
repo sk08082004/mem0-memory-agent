@@ -188,13 +188,55 @@ def main():
                     print("\nRelationship recovery preview (dry run):")
                     print(f"Eligible source IDs: {report['eligible']}")
                     print(f"Capped source IDs: {report['capped']}")
-                    print(f"Blocked records: {report['blocked']}")
-                    for detail in report["details"]:
-                        if detail["status"] == "blocked_missing_endpoint":
-                            print(
-                                f"- {detail['source_id']}: "
-                                f"{detail.get('reason', 'Missing endpoint.')}"
+                    blocked_records = [
+                        detail
+                        for detail in report["details"]
+                        if detail["status"] == "blocked_missing_endpoint"
+                    ]
+                    superseded_records = [
+                        detail
+                        for detail in report["details"]
+                        if detail["status"] == "superseded"
+                    ]
+
+                    def print_preview_detail(detail):
+                        endpoint_notes = []
+                        if detail.get("missing_source_ids"):
+                            endpoint_notes.append(
+                                "missing source endpoint(s): "
+                                f"{detail['missing_source_ids']}"
                             )
+                        if detail.get("missing_target_ids"):
+                            endpoint_notes.append(
+                                "missing target endpoint(s): "
+                                f"{detail['missing_target_ids']}"
+                            )
+                        if detail.get("replacement_id"):
+                            endpoint_notes.append(
+                                "replacement ID: "
+                                f"{detail['replacement_id']}"
+                            )
+                        if detail.get("reason"):
+                            endpoint_notes.append(detail["reason"])
+                        print(
+                            f"- {detail['source_id']}: {detail['status']}"
+                            + (
+                                f" ({'; '.join(endpoint_notes)})"
+                                if endpoint_notes
+                                else ""
+                            )
+                        )
+
+                    print(f"\nBlocked records ({len(blocked_records)}):")
+                    for detail in blocked_records:
+                        print_preview_detail(detail)
+
+                    print(
+                        f"\nSuperseded historical records "
+                        f"({len(superseded_records)}):"
+                    )
+                    for detail in superseded_records:
+                        print_preview_detail(detail)
                     if report["invalid_records"]:
                         print(
                             f"Invalid preserved records: "

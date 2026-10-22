@@ -134,6 +134,40 @@ class FakeGraph:
     def delete_node(self, user_id, memory_id):
         self.deleted_nodes.append((user_id, memory_id))
 
+    def reconcile_memory_replacement(
+        self,
+        user_id,
+        old_memory_id,
+        replacement_id,
+        replacement_text,
+    ):
+        if self.node_error:
+            raise self.node_error
+        self.delete_node(user_id, old_memory_id)
+        self.add_node(user_id, replacement_id, replacement_text)
+        blocked_sources = []
+        for (record_user, source_id), record in self.recovery.items():
+            if record_user == user_id and source_id != old_memory_id:
+                if any(
+                    edge.get("target_id") == old_memory_id
+                    for edge in record.get("expected_edges", [])
+                ):
+                    record["status"] = "blocked_missing_endpoint"
+                    record["error"] = (
+                        f"Source memory was replaced by {replacement_id}; "
+                        "relationships were not redirected."
+                    )
+                    blocked_sources.append(source_id)
+        old_record = self.recovery.get((user_id, old_memory_id))
+        if old_record:
+            old_record["status"] = "superseded"
+            old_record["replacement_id"] = replacement_id
+            old_record["error"] = (
+                f"Source memory was replaced by {replacement_id}; "
+                "relationships were not redirected."
+            )
+        return {"blocked_sources": blocked_sources}
+
     def get_user_graph(self, user_id):
         return {
             "nodes": [
@@ -454,6 +488,90 @@ class MemoryLifecycleTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(operations, ["add", "delete"])
         self.assertEqual(agent.graph.deleted_nodes, [(agent.user_id, "old")])
+
+    def test_replacement_supersedes_pending_and_completed_source_records(self):
+        for initial_status in ("pending_generation", "succeeded"):
+            with self.subTest(initial_status=initial_status):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    graph = KnowledgeGraph(os.path.join(temp_dir, "graph.json"))
+                    graph.add_node("user-a", "old", "old fact")
+                    graph.create_relationship_recovery("user-a", "old")
+                    if initial_status == "succeeded":
+                        graph.set_relationship_recovery_status(
+                            "user-a",
+                            "old",
+                            "succeeded",
+                        )
+
+                    agent = Agent.__new__(Agent)
+                    agent.user_id = "user-a"
+                    agent.graph = graph
+                    agent.memory = FakeMemory(
+                        add_result={"event_id": "new-event"},
+                        delete_result={"success": True},
+                    )
+                    agent.client = types.SimpleNamespace(
+                        models=FakeModels([evolution_response()])
+                    )
+                    agent.get_memory_id = lambda event_id: "replacement"
+                    agent.create_memory_relationships = lambda *args: True
+
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertTrue(
+                            agent.update_memory(
+                                "new information",
+                                [self.old_memory()],
+                            )
+                        )
+
+                    user_graph = graph.get_user_graph("user-a")
+                    self.assertEqual(
+                        [node["id"] for node in user_graph["nodes"]],
+                        ["replacement"],
+                    )
+                    recovery = user_graph["relationship_recovery"]["old"]
+                    self.assertEqual(recovery["status"], "superseded")
+                    self.assertEqual(recovery["replacement_id"], "replacement")
+                    self.assertIn("not redirected", recovery["error"])
+
+    def test_update_reports_partial_when_replacement_graph_save_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "graph.json")
+            graph = KnowledgeGraph(path)
+            graph.add_node("user-a", "old", "old fact")
+            graph.create_relationship_recovery("user-a", "old")
+            before_graph = copy.deepcopy(graph.graph)
+            with open(path, "rb") as graph_file:
+                before_file = graph_file.read()
+
+            agent = Agent.__new__(Agent)
+            agent.user_id = "user-a"
+            agent.graph = graph
+            agent.memory = FakeMemory(
+                add_result={"event_id": "new-event"},
+                delete_result={"success": True},
+            )
+            agent.client = types.SimpleNamespace(
+                models=FakeModels([evolution_response()])
+            )
+            agent.get_memory_id = lambda event_id: "replacement"
+            agent.create_memory_relationships = lambda *args: True
+
+            with patch.object(graph, "save", side_effect=OSError("disk full")):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertTrue(
+                        agent.update_memory(
+                            "new information",
+                            [self.old_memory()],
+                        )
+                    )
+
+            self.assertIn("partially completed", output.getvalue())
+            self.assertIn("disk full", output.getvalue())
+            self.assertEqual(graph.graph, before_graph)
+            with open(path, "rb") as graph_file:
+                self.assertEqual(graph_file.read(), before_file)
+            self.assertEqual(agent.memory.deleted, ["old"])
 
     def test_deduplication_confirms_replacement_then_deletes_unique_ids(self):
         agent = make_agent()
@@ -1072,6 +1190,109 @@ class KnowledgeGraphTests(unittest.TestCase):
                 self.graph.sync_user_graph("user-a", memories)
         self.assertEqual(self.graph.graph, before)
 
+    def test_replacement_blocks_pending_target_without_redirecting_it(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.add_node("user-a", "source", "Other source")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.set_pending_relationship_edges(
+            "user-a",
+            "source",
+            [{"target_id": "old", "relationship": "related_to"}],
+        )
+
+        result = self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "New meaning",
+        )
+
+        user_graph = self.graph.get_user_graph("user-a")
+        records = user_graph["relationship_recovery"]
+        self.assertEqual(records["old"]["status"], "superseded")
+        self.assertEqual(records["old"]["replacement_id"], "replacement")
+        self.assertEqual(records["source"]["status"], "blocked_missing_endpoint")
+        self.assertEqual(
+            records["source"]["expected_edges"],
+            [{"target_id": "old", "relationship": "related_to"}],
+        )
+        self.assertEqual(result["blocked_sources"], ["source"])
+        self.assertEqual(
+            {node["id"] for node in user_graph["nodes"]},
+            {"source", "replacement"},
+        )
+        self.assertEqual(user_graph["relationships"], [])
+
+    def test_replacement_graph_save_failure_preserves_durable_user_state(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.add_node("user-b", "private", "Private meaning")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        with patch.object(self.graph, "save", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.graph.reconcile_memory_replacement(
+                    "user-a",
+                    "old",
+                    "replacement",
+                    "New meaning",
+                )
+
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_replacement_reconciliation_is_user_scoped(self):
+        self.graph.add_node("user-a", "old", "A old")
+        self.graph.add_node("user-b", "old", "B old")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.create_relationship_recovery("user-b", "old")
+        before_b = copy.deepcopy(self.graph.graph["user-b"])
+
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "A replacement",
+        )
+
+        self.assertEqual(self.graph.graph["user-b"], before_b)
+
+    def test_sync_preserves_terminal_recovery_statuses_for_missing_sources(self):
+        for status in ("succeeded", "succeeded_empty", "superseded"):
+            with self.subTest(status=status):
+                graph = KnowledgeGraph(
+                    os.path.join(self.temp_dir.name, f"{status}.json")
+                )
+                graph.add_node("user-a", status, "Terminal source")
+                graph.create_relationship_recovery("user-a", status)
+                if status == "superseded":
+                    graph.reconcile_memory_replacement(
+                        "user-a",
+                        status,
+                        "replacement",
+                        "Replacement source",
+                    )
+                else:
+                    graph.set_relationship_recovery_status(
+                        "user-a",
+                        status,
+                        status,
+                    )
+
+                graph.sync_user_graph(
+                    "user-a",
+                    {"count": 0, "results": []},
+                )
+
+                record = graph.graph["user-a"]["relationship_recovery"][status]
+                self.assertEqual(record["status"], status)
+                if status != "superseded":
+                    self.assertIsNone(record["error"])
+
     def test_atomic_save_failure_preserves_existing_file_contents(self):
         self.graph.add_node("user-a", "a1", "A one")
         self.graph.add_node("user-a", "a2", "A two")
@@ -1443,6 +1664,52 @@ class RelationshipRecoveryTests(unittest.TestCase):
         with open(self.path, "rb") as graph_file:
             self.assertEqual(graph_file.read(), before_file)
 
+    def test_dry_run_reports_missing_endpoint_ids_and_replacement_read_only(self):
+        self.add_source_and_target("old-source", "target")
+        self.add_source_and_target("other-source", "other-target")
+        self.graph.create_relationship_recovery("user-a", "old-source")
+        self.graph.create_relationship_recovery("user-a", "other-source")
+        self.graph.set_pending_relationship_edges(
+            "user-a",
+            "other-source",
+            [{"target_id": "old-source", "relationship": "related_to"}],
+        )
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old-source",
+            "replacement",
+            "Replacement memory",
+        )
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+        self.agent.client = types.SimpleNamespace(models=FakeModels([]))
+
+        report = self.agent.recover_relationships(dry_run=True)
+
+        details = {
+            detail["source_id"]: detail
+            for detail in report["details"]
+        }
+        self.assertEqual(report["eligible"], [])
+        self.assertEqual(details["old-source"]["status"], "superseded")
+        self.assertEqual(
+            details["old-source"]["missing_source_ids"],
+            ["old-source"],
+        )
+        self.assertEqual(
+            details["old-source"]["replacement_id"],
+            "replacement",
+        )
+        self.assertEqual(
+            details["other-source"]["missing_target_ids"],
+            ["old-source"],
+        )
+        self.assertEqual(self.agent.client.models.calls, 0)
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
     def test_attempt_limit_prevents_model_calls_after_restart(self):
         self.add_source_and_target()
         self.graph.create_relationship_recovery("user-a", "source")
@@ -1498,6 +1765,30 @@ class RelationshipRecoveryTests(unittest.TestCase):
         report = self.agent.recover_relationships(dry_run=False)
         self.assertEqual(report["succeeded_empty"], 1)
         self.assertEqual(self.graph.graph["user-b"], before_b)
+
+    def test_superseded_record_is_never_retried(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "source",
+            "replacement",
+            "Replacement memory",
+        )
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        report = self.agent.recover_relationships(dry_run=False)
+
+        self.assertEqual(report["attempted"], 0)
+        self.assertEqual(report["succeeded"], 0)
+        self.assertEqual(models.calls, 0)
+        record = next(
+            item
+            for item in self.graph.get_relationship_recovery("user-a")["records"]
+            if item["source_id"] == "source"
+        )
+        self.assertEqual(record["status"], "superseded")
 
     def test_sync_preserves_recovery_records_unknown_fields_and_malformed_entries(self):
         self.add_source_and_target()
@@ -1663,7 +1954,51 @@ class CliAndSessionTests(unittest.TestCase):
                     "eligible": ["source"],
                     "invalid_records": [],
                     "remaining": 0,
-                    "details": [],
+                    "details": [
+                        {
+                            "source_id": "old-source",
+                            "status": "blocked_missing_endpoint",
+                            "missing_source_ids": ["old-source"],
+                            "missing_target_ids": [],
+                            "reason": "Source node is missing.",
+                        },
+                        {
+                            "source_id": "pending-source",
+                            "status": "blocked_missing_endpoint",
+                            "missing_source_ids": [],
+                            "missing_target_ids": ["old-target"],
+                            "reason": "Target node is missing.",
+                        },
+                        {
+                            "source_id": "previous-source-1",
+                            "status": "superseded",
+                            "missing_source_ids": ["previous-source-1"],
+                            "missing_target_ids": [],
+                            "replacement_id": "replacement-1",
+                            "reason": "Source replaced.",
+                        },
+                        {
+                            "source_id": "previous-source-2",
+                            "status": "superseded",
+                            "missing_source_ids": ["previous-source-2"],
+                            "missing_target_ids": [],
+                            "replacement_id": "replacement-2",
+                        },
+                        {
+                            "source_id": "previous-source-3",
+                            "status": "superseded",
+                            "missing_source_ids": ["previous-source-3"],
+                            "missing_target_ids": [],
+                            "replacement_id": "replacement-3",
+                        },
+                        {
+                            "source_id": "previous-source-4",
+                            "status": "superseded",
+                            "missing_source_ids": ["previous-source-4"],
+                            "missing_target_ids": [],
+                            "replacement_id": "replacement-4",
+                        },
+                    ],
                 }
 
         with patch.object(main_module, "Agent", FakeAgent), patch.object(
@@ -1682,6 +2017,16 @@ class CliAndSessionTests(unittest.TestCase):
         self.assertEqual(calls, [True, False])
         self.assertIn("No changes were made", output.getvalue())
         self.assertIn("Relationship recovery results", output.getvalue())
+        self.assertIn("missing source endpoint(s): ['old-source']", output.getvalue())
+        self.assertIn("missing target endpoint(s): ['old-target']", output.getvalue())
+        self.assertIn("Blocked records (2):", output.getvalue())
+        self.assertIn("Superseded historical records (4):", output.getvalue())
+        self.assertLess(
+            output.getvalue().find("Blocked records (2):"),
+            output.getvalue().find("Superseded historical records (4):"),
+        )
+        self.assertIn("replacement ID: replacement-1", output.getvalue())
+        self.assertIn("Source replaced.", output.getvalue())
 
     def test_save_rejects_blank_ids_and_persistence_failure_preserves_file(self):
         for value in ("", "  ", None, 2):

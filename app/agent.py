@@ -775,26 +775,63 @@ User message:
                 and node["id"].strip()
             )
         }
+
+        def endpoint_details(record, status, reason=None):
+            source_id = record["source_id"]
+            expected_edges = record.get("expected_edges", [])
+            missing_target_ids = []
+            if isinstance(expected_edges, list):
+                missing_target_ids = sorted(
+                    {
+                        edge["target_id"]
+                        for edge in expected_edges
+                        if (
+                            isinstance(edge, dict)
+                            and isinstance(edge.get("target_id"), str)
+                            and edge["target_id"] not in node_ids
+                        )
+                    }
+                )
+            detail = {
+                "source_id": source_id,
+                "status": status,
+                "missing_source_ids": (
+                    [source_id] if source_id not in node_ids else []
+                ),
+                "missing_target_ids": missing_target_ids,
+            }
+            if reason:
+                detail["reason"] = reason
+            replacement_id = record.get("replacement_id")
+            if isinstance(replacement_id, str) and replacement_id.strip():
+                detail["replacement_id"] = replacement_id
+            return detail
+
         eligible = []
         for record in recovery["records"]:
             status = record["status"]
             source_id = record["source_id"]
             if status in {"succeeded", "succeeded_empty"}:
                 continue
+            if status == "superseded":
+                report["details"].append(
+                    endpoint_details(record, status, record.get("error"))
+                )
+                continue
             if status == "blocked_missing_endpoint":
                 report["blocked"] += 1
                 report["details"].append(
-                    {"source_id": source_id, "status": status, "reason": record.get("error")}
+                    endpoint_details(record, status, record.get("error"))
                 )
                 continue
             if source_id not in node_ids:
                 report["blocked"] += 1
                 report["details"].append(
-                    {
-                        "source_id": source_id,
-                        "status": "blocked_missing_endpoint",
-                        "reason": "Source node is missing.",
-                    }
+                    endpoint_details(
+                        record,
+                        "blocked_missing_endpoint",
+                        "Source node is missing.",
+                    )
                 )
                 if not dry_run:
                     try:
@@ -822,11 +859,11 @@ User message:
             if missing_target:
                 report["blocked"] += 1
                 report["details"].append(
-                    {
-                        "source_id": source_id,
-                        "status": "blocked_missing_endpoint",
-                        "reason": "One or more target nodes are missing.",
-                    }
+                    endpoint_details(
+                        record,
+                        "blocked_missing_endpoint",
+                        "One or more target nodes are missing.",
+                    )
                 )
                 if not dry_run:
                     try:
@@ -1716,37 +1753,63 @@ If there are no updates, return:
                         )
 
                     graph_errors = []
+                    recovery_warnings = []
+                    graph_reconciled = False
                     if deletion_confirmed:
                         try:
-                            self.graph.delete_node(
+                            reconciliation = self.graph.reconcile_memory_replacement(
                                 self.user_id,
-                                memory_id
+                                memory_id,
+                                new_memory_id,
+                                memory_text,
                             )
+                            graph_reconciled = True
+                            blocked_sources = reconciliation.get(
+                                "blocked_sources",
+                                [],
+                            )
+                            if blocked_sources:
+                                recovery_warnings.append(
+                                    "Pending recovery records were blocked "
+                                    "because their expected target was replaced: "
+                                    f"{blocked_sources}"
+                                )
+                        except Exception as e:
+                            graph_errors.append(str(e))
+                    else:
+                        try:
+                            self.graph.add_node(
+                                self.user_id,
+                                new_memory_id,
+                                memory_text
+                            )
+                            graph_reconciled = True
                         except Exception as e:
                             graph_errors.append(str(e))
 
-                    try:
-                        self.graph.add_node(
-                            self.user_id,
-                            new_memory_id,
-                            memory_text
-                        )
-                        if not self.create_memory_relationships(
-                            new_memory_id,
-                            memory_text
-                        ):
-                            graph_errors.append("Relationship creation failed.")
-                    except Exception as e:
-                        graph_errors.append(str(e))
+                    if graph_reconciled:
+                        try:
+                            if not self.create_memory_relationships(
+                                new_memory_id,
+                                memory_text
+                            ):
+                                graph_errors.append("Relationship creation failed.")
+                        except Exception as e:
+                            graph_errors.append(str(e))
 
-                    if deletion_confirmed and not graph_errors:
+                    if (
+                        deletion_confirmed
+                        and not graph_errors
+                        and not recovery_warnings
+                    ):
                         print("[MEMORY] Memory updated successfully.")
                     else:
                         print(
                             f"[MEMORY] Memory update partially completed. "
                             f"Replacement ID: {new_memory_id}; "
                             f"old memory deletion confirmed: {deletion_confirmed}; "
-                            f"graph reconciliation errors: {graph_errors}"
+                            f"graph reconciliation errors: {graph_errors}; "
+                            f"recovery warnings: {recovery_warnings}"
                         )
 
                     # A confirmed replacement must not be stored a second time,
