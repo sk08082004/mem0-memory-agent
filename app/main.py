@@ -1,6 +1,28 @@
 from app.agent import Agent
 from app.config import SESSION_FILE
-import json, os
+import json
+import os
+import tempfile
+
+
+def normalize_user_id(user_id):
+    if not isinstance(user_id, str):
+        return None
+
+    normalized_user_id = user_id.strip()
+    return normalized_user_id or None
+
+
+def create_agent(user_id):
+    normalized_user_id = normalize_user_id(user_id)
+    if normalized_user_id is None:
+        raise ValueError("User ID must be a non-empty string.")
+
+    agent = Agent(normalized_user_id)
+    if getattr(agent, "user_id", None) != normalized_user_id:
+        raise ValueError("Agent was initialized for an unexpected user ID.")
+
+    return agent
 
 
 def load_user():
@@ -8,15 +30,46 @@ def load_user():
         with open(SESSION_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
 
-            return data.get("user_id")
+        if not isinstance(data, dict):
+            return None
 
-    except (FileNotFoundError, json.JSONDecodeError):
+        return normalize_user_id(data.get("user_id"))
+
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError
+    ) as e:
+        if isinstance(e, OSError) and not isinstance(e, FileNotFoundError):
+            print(f"[WARNING] Could not read session file: {e}")
         return None
 
 
 def save_user(user_id):
-    with open(SESSION_FILE, "w", encoding="utf-8") as file:
-        json.dump({"user_id": user_id}, file)
+    normalized_user_id = normalize_user_id(user_id)
+    if normalized_user_id is None:
+        raise ValueError("User ID must be a non-empty string.")
+
+    session_path = os.path.abspath(SESSION_FILE)
+    session_directory = os.path.dirname(session_path)
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=session_directory,
+            delete=False
+        ) as file:
+            temporary_path = file.name
+            json.dump({"user_id": normalized_user_id}, file)
+
+        os.replace(temporary_path, session_path)
+    except Exception:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
 
 
 def remove_user():
@@ -78,11 +131,16 @@ def main():
 
     user_id = load_user()
 
-    if not user_id:
-        user_id = input("Enter your user ID: ").strip()
-        save_user(user_id)
+    if user_id is None:
+        while user_id is None:
+            user_id = normalize_user_id(input("Enter your user ID: "))
+            if user_id is None:
+                print("\nUser ID cannot be empty.\n")
 
-    agent = Agent(user_id)
+        agent = create_agent(user_id)
+        save_user(user_id)
+    else:
+        agent = create_agent(user_id)
 
     while True:
         user_input = input("You: ").strip()
@@ -120,7 +178,7 @@ def main():
         # show knowledge graph
         if user_input.lower() == "/graph":
             try:
-                memories = agent.memory.get_all(agent.user_id)
+                memories = agent.memory.get_all_complete(agent.user_id)
 
                 agent.graph.sync_user_graph(
                     agent.user_id,
@@ -130,8 +188,6 @@ def main():
                 user_graph = agent.graph.get_user_graph(
                     agent.user_id
                 )
-
-                user_graph = agent.graph.get_user_graph(agent.user_id)
 
                 nodes = user_graph.get("nodes", [])
                 relationships = user_graph.get("relationships", [])
@@ -144,17 +200,13 @@ def main():
                     print("No nodes in the graph.")
                     continue
 
-                    # create a number for each memory
-                    node_number = {}
+                node_number = {}
 
-                    print("\nMemories:")
+                print("\nMemories:")
 
-                    for i, memory in enumerate(
-                        memories["results"],
-                        start=1
-                    ):
-                        node_number[memory["id"]] = i
-                        print(f"{i}. {memory['memory']}")
+                for i, node in enumerate(nodes, start=1):
+                    node_number[node["id"]] = i
+                    print(f"{i}. {node['memory_text']}")
 
                 if relationships:
                     print("\nRelationships:")
@@ -205,7 +257,7 @@ def main():
 
             try:
                 # Get the current Mem0 memories
-                memories = agent.memory.get_all(agent.user_id)
+                memories = agent.memory.get_all_complete(agent.user_id)
 
                 # Synchronize the graph with Mem0
                 agent.graph.sync_user_graph(
@@ -383,31 +435,41 @@ def main():
                 print("\nUsage: /login <user_id>\n")
                 continue
 
-            user_id = parts[1].strip()
+            user_id = normalize_user_id(parts[1])
 
             if not user_id:
                 print("\nUser ID cannot be empty.\n")
                 continue
 
-            save_user(user_id)
-            agent = Agent(user_id)
+            try:
+                new_agent = create_agent(user_id)
+                save_user(user_id)
+            except Exception as e:
+                print(f"\n[ERROR] Could not log in as {user_id}: {e}\n")
+                continue
 
+            agent = new_agent
             print(f"\nLogged in as: {agent.user_id}\n")
             continue
 
         # Logout current user
         if user_input.lower() == "/logout":
-            remove_user()
-
-            user_id = input("Enter your user ID: ").strip()
+            user_id = normalize_user_id(
+                input("Enter your user ID: ")
+            )
 
             if not user_id:
-                print("\nUser ID cannot be empty.\n")
+                print("\nLogout cancelled; user ID cannot be empty.\n")
                 continue
 
-            save_user(user_id)
-            agent = Agent(user_id)
+            try:
+                new_agent = create_agent(user_id)
+                save_user(user_id)
+            except Exception as e:
+                print(f"\n[ERROR] Could not switch to {user_id}: {e}\n")
+                continue
 
+            agent = new_agent
             print(f"\nLogged in as: {agent.user_id}\n")
             continue
 
@@ -440,14 +502,34 @@ def main():
 
                 print(f"\nDeleting: {memory['memory']}")
 
-                add_result = agent.memory.delete(memory_id)
+                delete_result = agent.memory.delete(memory_id)
+                delete_status = agent.memory.delete_result_status(
+                    delete_result
+                )
 
-                agent.graph.delete_node(
-                agent.user_id,
-                memory_id
-)
-
-                print("Memory deleted.\n")
+                if delete_status == "confirmed":
+                    try:
+                        agent.graph.delete_node(
+                            agent.user_id,
+                            memory_id
+                        )
+                    except Exception as e:
+                        print(
+                            "\n[WARNING] Mem0 deletion was confirmed, but "
+                            f"graph cleanup failed: {e}\n"
+                        )
+                    else:
+                        print("Memory deleted.\n")
+                elif delete_status == "failed":
+                    print(
+                        "\n[ERROR] Mem0 reported that deletion failed; "
+                        "the graph was left unchanged.\n"
+                    )
+                else:
+                    print(
+                        "\n[WARNING] Memory deletion could not be confirmed; "
+                        "the graph was left unchanged.\n"
+                    )
 
             except Exception as e:
                 print(
@@ -459,10 +541,14 @@ def main():
         # Clear all memories command
         if user_input.lower() == "/clear":
             try:
-                memories = agent.memory.get_all(agent.user_id)
+                memories = agent.memory.get_all_complete(agent.user_id)
 
                 if memories["count"] == 0:
                     print("\nNo memories to clear.\n")
+                    agent.graph.sync_user_graph(
+                        agent.user_id,
+                        memories
+                    )
                     continue
 
                 confirm = input(
@@ -471,13 +557,46 @@ def main():
                 ).strip().lower()
 
                 if confirm == "yes":
-                    try:
-                        agent.memory.clear(agent.user_id)
-                        print("\nAll memories deleted.\n")
+                    result = agent.memory.clear(agent.user_id)
 
-                    except Exception as e:
+                    if not result["retrieval_complete"]:
                         print(
-                            f"\n[ERROR] Could not clear memories: {e}\n"
+                            "\n[ERROR] Could not safely clear memories: "
+                            f"{result['error']}\n"
+                        )
+                        continue
+
+                    graph_synced = False
+                    if result["remaining_retrieval_complete"]:
+                        try:
+                            agent.graph.sync_user_graph(
+                                agent.user_id,
+                                result["remaining_memories"]
+                            )
+                            graph_synced = True
+                        except Exception as e:
+                            print(
+                                "\n[ERROR] Mem0 deletion results were recorded, "
+                                "but graph synchronization failed: "
+                                f"{e}\n"
+                            )
+                    else:
+                        print(
+                            "\n[WARNING] Could not verify remaining memories; "
+                            "the graph was left unchanged. "
+                            f"Details: {result['error']}\n"
+                        )
+
+                    if result.get("complete") and graph_synced:
+                        print("\nAll memories were cleared and the graph synchronized.\n")
+                    else:
+                        print(
+                            "\n[WARNING] Clear was partial or could not be "
+                            "fully confirmed.\n"
+                            f"Confirmed deleted IDs: {result['deleted_ids']}\n"
+                            f"Failed IDs: {result['failed_ids']}\n"
+                            f"Unconfirmed IDs: {result['unconfirmed_ids']}\n"
+                            f"Remaining IDs: {result['remaining_ids']}\n"
                         )
 
                 else:

@@ -55,6 +55,146 @@ class Agent:
 
         return max(0.0, min(confidence, 1.0))
 
+    @staticmethod
+    def _delete_succeeded(result):
+        return MemoryManager.delete_result_status(result) == "confirmed"
+
+    @staticmethod
+    def _parse_evolution(evolution):
+        if isinstance(evolution, str):
+            try:
+                return json.loads(evolution)
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        return evolution
+
+    @classmethod
+    def _historical_memory_ids(cls, evolution):
+        evolution = cls._parse_evolution(evolution)
+        historical_ids = set()
+
+        if isinstance(evolution, dict):
+            previous_id = evolution.get("previous_memory_id")
+            if previous_id:
+                historical_ids.add(previous_id)
+
+            history = evolution.get("history", [])
+            if isinstance(history, list):
+                for change in history:
+                    if isinstance(change, dict):
+                        memory_id = change.get("memory_id")
+                        if memory_id:
+                            historical_ids.add(memory_id)
+
+            evolution = evolution.get("legacy_entries", [])
+
+        if isinstance(evolution, list):
+            for entry in evolution:
+                if isinstance(entry, str) and entry.startswith(
+                    "previous_memory_id."
+                ):
+                    historical_ids.add(entry.split(".", 1)[1])
+                elif isinstance(entry, dict) and entry.get("memory_id"):
+                    historical_ids.add(entry["memory_id"])
+
+        return historical_ids
+
+    @classmethod
+    def _merge_deduplication_metadata(
+        cls,
+        source_memories,
+        importance,
+        confidence,
+        reason
+    ):
+        merged_metadata = {}
+        history = []
+        legacy_entries = []
+        legacy_values = []
+        source_evolutions = []
+        has_evolution = False
+
+        for memory in source_memories:
+            metadata = memory.get("metadata", {})
+            if isinstance(metadata, dict):
+                for key, value in metadata.items():
+                    if key != "evolution" and key not in merged_metadata:
+                        merged_metadata[key] = value
+
+                if "evolution" not in metadata:
+                    continue
+
+                has_evolution = True
+                raw_evolution = metadata["evolution"]
+                source_evolution = {
+                    "memory_id": memory.get("id"),
+                    "value": raw_evolution
+                }
+                if source_evolution not in source_evolutions:
+                    source_evolutions.append(source_evolution)
+
+                evolution = cls._parse_evolution(raw_evolution)
+                if isinstance(evolution, dict):
+                    existing_history = evolution.get("history", [])
+                    if isinstance(existing_history, list):
+                        for entry in existing_history:
+                            if entry not in history:
+                                history.append(entry)
+
+                    if evolution.get("previous_memory"):
+                        previous_entry = {
+                            "memory_id": evolution.get(
+                                "previous_memory_id"
+                            ),
+                            "from": evolution["previous_memory"],
+                            "to": memory.get("memory", "")
+                        }
+                        if previous_entry not in history:
+                            history.insert(0, previous_entry)
+
+                    existing_legacy_entries = evolution.get(
+                        "legacy_entries",
+                        []
+                    )
+                    if isinstance(existing_legacy_entries, list):
+                        for entry in existing_legacy_entries:
+                            if entry not in legacy_entries:
+                                legacy_entries.append(entry)
+                elif isinstance(evolution, list):
+                    for entry in evolution:
+                        if entry not in legacy_entries:
+                            legacy_entries.append(entry)
+                elif isinstance(raw_evolution, str):
+                    if raw_evolution not in legacy_values:
+                        legacy_values.append(raw_evolution)
+        merged_metadata.update(
+            {
+                "importance": importance,
+                "confidence": confidence,
+                "reason": reason,
+            }
+        )
+        merged_metadata["source_memories"] = [
+            dict(memory) for memory in source_memories
+        ]
+
+        if has_evolution:
+            evolution_metadata = {}
+            if history:
+                evolution_metadata["history"] = history
+            if legacy_entries:
+                evolution_metadata["legacy_entries"] = legacy_entries
+            if legacy_values:
+                evolution_metadata["legacy_values"] = legacy_values
+                if len(legacy_values) == 1:
+                    evolution_metadata["legacy_value"] = legacy_values[0]
+            if source_evolutions:
+                evolution_metadata["source_evolutions"] = source_evolutions
+            merged_metadata["evolution"] = json.dumps(evolution_metadata)
+
+        return merged_metadata
+
     def get_memory_id(self, event_id, attempts=30, delay=1):
         """
         Wait for a Mem0 add event to finish
@@ -272,22 +412,56 @@ User message:
                     }
                 )
 
-                    # Add the memory to the knowledge graph
-                if add_result:
-                    print(f"[GRAPH] Add result: {add_result}")
-
-                    graph_node_id = self.get_memory_id(
-                    add_result.get("event_id")
+                if not isinstance(add_result, dict) or not add_result:
+                    print(
+                        "[MEMORY] Add returned no result; graph representation "
+                        "could not be confirmed."
                     )
+                    continue
 
-                    print(f"[GRAPH] Found memory ID: {graph_node_id}")
+                event_id = add_result.get("event_id")
+                if not isinstance(event_id, str) or not event_id.strip():
+                    print(
+                        "[MEMORY] Add returned no event ID; the memory may be "
+                        "stored, but graph representation is pending."
+                    )
+                    stored_any = True
+                    continue
 
-                    if graph_node_id:
-                        self.graph.add_node(
-                            self.user_id,
-                            graph_node_id,
-                            memory_text
-                        )
+                graph_node_id = self.get_memory_id(event_id)
+                if not isinstance(graph_node_id, str) or not graph_node_id.strip():
+                    print(
+                        "[MEMORY] Mem0 accepted the memory, but its memory ID "
+                        "could not be confirmed; graph representation is pending."
+                    )
+                    stored_any = True
+                    continue
+
+                try:
+                    self.graph.add_node(
+                        self.user_id,
+                        graph_node_id,
+                        memory_text
+                    )
+                except Exception as e:
+                    print(
+                        f"[MEMORY] Mem0 memory {graph_node_id} was stored, but "
+                        f"graph node creation failed: {e}"
+                    )
+                    stored_any = True
+                    continue
+
+                if self.create_memory_relationships(graph_node_id, memory_text):
+                    print(
+                        f"[MEMORY] Mem0 memory {graph_node_id} and graph "
+                        "relationships were stored."
+                    )
+                else:
+                    print(
+                        f"[MEMORY] Mem0 memory {graph_node_id} and its graph "
+                        "node were stored, but relationship persistence failed; "
+                        "graph synchronization or retry is needed."
+                    )
 
                 stored_any = True
 
@@ -314,16 +488,21 @@ User message:
 
         try:
             user_graph = self.graph.get_user_graph(self.user_id)
+            graph_nodes = user_graph.get("nodes", [])
+            if not any(node.get("id") == memory_id for node in graph_nodes):
+                raise ValueError(
+                    "The new memory is not present in the user's graph."
+                )
 
             existing_nodes = [
                 node
-                for node in user_graph.get("nodes", [])
+                for node in graph_nodes
                 if node["id"] != memory_id
             ]
 
             # Nothing to connect to.
             if not existing_nodes:
-                return
+                return True
 
             # Keep the prompt reasonably small.
             existing_nodes = existing_nodes[:10]
@@ -390,31 +569,58 @@ User message:
             )
 
             result = json.loads(response.text)
+            if (
+                not isinstance(result, dict)
+                or not isinstance(result.get("relationships"), list)
+            ):
+                raise ValueError(
+                    "Relationship response must contain a relationships list."
+                )
 
             valid_ids = {
                 node["id"]
                 for node in existing_nodes
             }
 
-            for item in result.get("relationships", []):
+            relationships = []
+            for item in result["relationships"]:
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "Relationship entries must be objects."
+                    )
+
                 target_id = item.get("target_id")
                 relationship = item.get("relationship")
-
                 if (
-                    target_id in valid_ids
-                    and relationship
+                    not isinstance(target_id, str)
+                    or not target_id.strip()
+                    or target_id not in valid_ids
+                    or not isinstance(relationship, str)
+                    or not relationship.strip()
                 ):
-                    self.graph.add_relationship(
-                        self.user_id,
-                        memory_id,
-                        target_id,
-                        relationship
+                    raise ValueError(
+                        "Relationship entry contains invalid endpoints or label."
                     )
+                relationships.append((target_id, relationship))
+
+            for target_id, relationship in relationships:
+                if not self.graph.add_relationship(
+                    self.user_id,
+                    memory_id,
+                    target_id,
+                    relationship
+                ):
+                    raise ValueError(
+                        f"Graph rejected relationship to memory {target_id}."
+                    )
+
+            return True
 
         except Exception as e:
             print(
                 f"[GRAPH] Relationship creation failed: {e}"
             )
+            return False
 
     def deduplicate_memory(self, memory_text, importance, reason, confidence):
         """
@@ -680,6 +886,7 @@ Format when there is no duplicate:
                 for memory_id in duplicate_ids
                 if memory_id in valid_ids
             ]
+            duplicate_ids = list(dict.fromkeys(duplicate_ids))
 
             if not duplicate_ids:
                 return False
@@ -710,30 +917,28 @@ Format when there is no duplicate:
                 "reason",
                 "Merged from duplicate memories."
             )
+            candidate_by_id = {
+                memory["id"]: memory
+                for memory in candidates
+            }
+            source_memories = [
+                candidate_by_id[memory_id]
+                for memory_id in duplicate_ids
+            ]
+            merged_metadata = self._merge_deduplication_metadata(
+                source_memories,
+                merged_importance,
+                merged_confidence,
+                merged_reason
+            )
+            merged_metadata["source"] = source_memories[0].get(
+                "metadata", {}
+            ).get("source", "conversation") if isinstance(
+                source_memories[0].get("metadata", {}),
+                dict
+            ) else "conversation"
 
-            # Delete the old duplicate memories.
-            for memory_id in duplicate_ids:
-                print(
-                    f"[MEMORY] Removing duplicate memory: {memory_id}"
-                )
-                self.memory.delete(memory_id)
-
-            # Remove the duplicate memories.
-            for duplicate_id in duplicate_ids:
-                print(
-                    f"[MEMORY] Removing duplicate memory: {duplicate_id}"
-                )
-
-                self.memory.delete(duplicate_id)
-
-                # Also remove the duplicate from the knowledge graph.
-                self.graph.delete_node(
-                    self.user_id,
-                    duplicate_id
-                )
-
-
-            # Store the merged memory.
+            # Create and confirm the replacement before deleting originals.
             messages = [
                 {
                     "role": "user",
@@ -744,31 +949,84 @@ Format when there is no duplicate:
             add_result = self.memory.add(
                 messages,
                 self.user_id,
-                metadata={
-                    "importance": merged_importance,
-                    "confidence": merged_confidence,
-                    "reason": merged_reason,
-                    "source": "conversation"
-                }
+                metadata=merged_metadata
             )
 
-            # Add the merged memory to the knowledge graph.
-            if add_result:
-                merged_memory_id = self.get_memory_id(
-                add_result.get("event_id")
+            if not isinstance(add_result, dict) or not add_result:
+                print(
+                    "[MEMORY] Merged-memory creation returned no result; "
+                    "original memories were preserved."
                 )
+                return False
 
-                if merged_memory_id:
-                    self.graph.add_node(
+            event_id = add_result.get("event_id")
+            if not isinstance(event_id, str) or not event_id.strip():
+                print(
+                    "[MEMORY] Merged-memory creation returned no event ID; "
+                    "original memories were preserved."
+                )
+                return False
+
+            merged_memory_id = self.get_memory_id(event_id)
+            if not isinstance(merged_memory_id, str) or not merged_memory_id.strip():
+                print(
+                    "[MEMORY] Could not confirm the merged memory ID; "
+                    "original memories were preserved."
+                )
+                return False
+
+            deleted_ids = []
+            failed_deletions = []
+            for duplicate_id in duplicate_ids:
+                try:
+                    delete_result = self.memory.delete(duplicate_id)
+                    if self._delete_succeeded(delete_result):
+                        deleted_ids.append(duplicate_id)
+                    else:
+                        failed_deletions.append(duplicate_id)
+                        print(
+                            f"[MEMORY] Could not confirm deletion of "
+                            f"duplicate memory {duplicate_id}."
+                        )
+                except Exception as e:
+                    failed_deletions.append(duplicate_id)
+                    print(
+                        f"[MEMORY] Could not delete duplicate memory "
+                        f"{duplicate_id}: {e}"
+                    )
+
+            graph_errors = []
+            for duplicate_id in deleted_ids:
+                try:
+                    self.graph.delete_node(
                         self.user_id,
-                        merged_memory_id,
-                        merged_memory
+                        duplicate_id
                     )
+                except Exception as e:
+                    graph_errors.append(str(e))
 
-                    self.create_memory_relationships(
-                        merged_memory_id,
-                        merged_memory
-                    )
+            try:
+                self.graph.add_node(
+                    self.user_id,
+                    merged_memory_id,
+                    merged_memory
+                )
+                if not self.create_memory_relationships(
+                    merged_memory_id,
+                    merged_memory
+                ):
+                    graph_errors.append("Relationship creation failed.")
+            except Exception as e:
+                graph_errors.append(str(e))
+
+            if failed_deletions or graph_errors:
+                print(
+                    "[MEMORY] Merge partially completed. "
+                    f"Merged memory ID: {merged_memory_id}; "
+                    f"duplicates not confirmed deleted: {failed_deletions}; "
+                    f"graph reconciliation errors: {graph_errors}"
+                )
+                return True
 
             print(
                 "[MEMORY] Duplicate memories merged successfully."
@@ -955,12 +1213,28 @@ If there are no updates, return:
                     else ""
                 )
 
+                old_metadata = old_memory.get("metadata", {}) if old_memory else {}
+                if not isinstance(old_metadata, dict):
+                    old_metadata = {}
+
                 memory_text = update.get("text", "").strip()
-                importance = update.get("importance", 5)
-                confidence = self._normalize_confidence(update.get("confidence", 0.5))
+                importance = update.get(
+                    "importance",
+                    old_metadata.get("importance", 5)
+                )
+                confidence = self._normalize_confidence(
+                    update.get(
+                        "confidence",
+                        old_metadata.get("confidence", 0.5)
+                    ),
+                    old_metadata.get("confidence", 0.5)
+                )
                 reason = update.get(
                     "reason",
-                    "Updated based on the user's latest message."
+                    old_metadata.get(
+                        "reason",
+                        "Updated based on the user's latest message."
+                    )
                 )
 
                 # Never allow Gemini to modify a memory that was not
@@ -981,36 +1255,42 @@ If there are no updates, return:
                         }
                     ]
 
-                    old_metadata = old_memory.get("metadata", {}) if old_memory else {}
-                    old_evolution = old_metadata.get("evolution", {})
-
+                    raw_evolution = old_metadata.get("evolution", {})
+                    old_evolution = self._parse_evolution(raw_evolution)
                     history = []
 
                     if isinstance(old_evolution, dict):
-                        existing_history = old_evolution.get("history", [])
+                        evolution_metadata = dict(old_evolution)
+                        existing_history = evolution_metadata.get("history", [])
                         if isinstance(existing_history, list):
                             history.extend(existing_history)
+                        elif "history" in evolution_metadata:
+                            evolution_metadata["legacy_history"] = (
+                                evolution_metadata["history"]
+                            )
 
-                        if old_evolution.get("previous_memory"):
+                        if evolution_metadata.get("previous_memory"):
                             history.insert(
                                 0,
                                 {
-                                    "memory_id": old_evolution.get("previous_memory_id"),
-                                    "from": old_evolution.get("previous_memory"),
+                                    "memory_id": evolution_metadata.get(
+                                        "previous_memory_id"
+                                    ),
+                                    "from": evolution_metadata.get(
+                                        "previous_memory"
+                                    ),
                                     "to": old_memory_text
                                 }
                             )
 
-                    elif isinstance(old_evolution, str):
-                        try:
-                            parsed_evolution = json.loads(old_evolution)
-                            existing_history = parsed_evolution.get(
-                                "history", []
-                            )
-                            if isinstance(existing_history, list):
-                                history.extend(existing_history)
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                    elif isinstance(old_evolution, list):
+                        evolution_metadata = {
+                            "legacy_entries": list(old_evolution)
+                        }
+                    elif isinstance(raw_evolution, str):
+                        evolution_metadata = {"legacy_value": raw_evolution}
+                    else:
+                        evolution_metadata = {}
 
                     history.append(
                         {
@@ -1024,49 +1304,92 @@ If there are no updates, return:
                         messages,
                         self.user_id,
                         metadata={
+                            **old_metadata,
                             "importance": importance,
                             "confidence": confidence,
                             "reason": reason,
-                            "source": "conversation",
-                            "evolution": json.dumps(
-                                {
-                                    "history": history
-                                }
-                            ),
-                        },
+                            "source": old_metadata.get("source", "conversation"),
+                            "evolution": json.dumps({
+                                **evolution_metadata,
+                                "history": history
+                            }),
+                        }
                     )
 
-                    # Get the actual ID of the newly created Mem0 memory.
-                    new_memory_id = None
+                    if not isinstance(new_add_result, dict) or not new_add_result:
+                        print(
+                            f"[MEMORY] Replacement creation returned no result "
+                            f"for {memory_id}; original memory was preserved."
+                        )
+                        continue
 
-                    if new_add_result:
-                        new_memory_id = self.get_memory_id(
-                        new_add_result.get("event_id")
+                    event_id = new_add_result.get("event_id")
+                    if not isinstance(event_id, str) or not event_id.strip():
+                        print(
+                            f"[MEMORY] Replacement creation returned no event ID "
+                            f"for {memory_id}; original memory was preserved."
+                        )
+                        continue
+
+                    new_memory_id = self.get_memory_id(event_id)
+                    if not isinstance(new_memory_id, str) or not new_memory_id.strip():
+                        print(
+                            f"[MEMORY] Could not confirm the replacement ID for "
+                            f"{memory_id}; original memory was preserved."
+                        )
+                        continue
+
+                    deletion_confirmed = False
+                    try:
+                        delete_result = self.memory.delete(memory_id)
+                        deletion_confirmed = self._delete_succeeded(delete_result)
+                        if not deletion_confirmed:
+                            print(
+                                f"[MEMORY] Replacement {new_memory_id} was created, "
+                                f"but deletion of {memory_id} was not confirmed."
+                            )
+                    except Exception as e:
+                        print(
+                            f"[MEMORY] Replacement {new_memory_id} was created, "
+                            f"but deletion of {memory_id} failed: {e}"
                         )
 
-                    # Delete the old Mem0 memory.
-                    self.memory.delete(memory_id)
+                    graph_errors = []
+                    if deletion_confirmed:
+                        try:
+                            self.graph.delete_node(
+                                self.user_id,
+                                memory_id
+                            )
+                        except Exception as e:
+                            graph_errors.append(str(e))
 
-                    # Keep the knowledge graph synchronized.
-                    self.graph.delete_node(
-                        self.user_id,
-                        memory_id
-                    )
-
-                    if new_memory_id:
+                    try:
                         self.graph.add_node(
                             self.user_id,
                             new_memory_id,
                             memory_text
                         )
-
-                        self.create_memory_relationships(
+                        if not self.create_memory_relationships(
                             new_memory_id,
                             memory_text
+                        ):
+                            graph_errors.append("Relationship creation failed.")
+                    except Exception as e:
+                        graph_errors.append(str(e))
+
+                    if deletion_confirmed and not graph_errors:
+                        print("[MEMORY] Memory updated successfully.")
+                    else:
+                        print(
+                            f"[MEMORY] Memory update partially completed. "
+                            f"Replacement ID: {new_memory_id}; "
+                            f"old memory deletion confirmed: {deletion_confirmed}; "
+                            f"graph reconciliation errors: {graph_errors}"
                         )
 
-                    print("[MEMORY] Memory updated successfully.")
-
+                    # A confirmed replacement must not be stored a second time,
+                    # even when deletion or graph reconciliation is partial.
                     updated_any = True
 
                 except Exception as e:
@@ -1303,19 +1626,11 @@ User message:
         historical_ids = set()
 
         for item in candidate_memories:
-            evolution = item.get("metadata", {}).get("evolution", {})
-
-            if isinstance(evolution, dict):
-                previous_id = evolution.get("previous_memory_id")
-                if previous_id:
-                    historical_ids.add(previous_id)
-
-            elif isinstance(evolution, list):
-                for entry in evolution:
-                    if isinstance(entry, str) and entry.startswith(
-                        "previous_memory_id."
-                    ):
-                        historical_ids.add(entry.split(".", 1)[1])
+            historical_ids.update(
+                self._historical_memory_ids(
+                    item.get("metadata", {}).get("evolution", {})
+                )
+            )
 
         candidate_memories = [
             item
@@ -1339,36 +1654,11 @@ User message:
             historical_ids = set()
 
             for item in memories["results"]:
-                evolution = item.get("metadata", {}).get("evolution")
-
-                if isinstance(evolution, str):
-                    try:
-                        evolution = json.loads(evolution)
-                    except (json.JSONDecodeError, TypeError):
-                        evolution = None
-
-                if isinstance(evolution, dict):
-                    previous_id = evolution.get("previous_memory_id")
-                    if previous_id:
-                        historical_ids.add(previous_id)
-
-                    history = evolution.get("history", [])
-                    if isinstance(history, list):
-                        for change in history:
-                            if isinstance(change, dict):
-                                memory_id = change.get("memory_id")
-                                if memory_id:
-                                    historical_ids.add(memory_id)
-
-                elif isinstance(evolution, list):
-                    for entry in evolution:
-                        if (
-                            isinstance(entry, str)
-                            and entry.startswith("previous_memory_id.")
-                        ):
-                            historical_ids.add(
-                                entry.split(".", 1)[1]
-                            )
+                historical_ids.update(
+                    self._historical_memory_ids(
+                        item.get("metadata", {}).get("evolution")
+                    )
+                )
 
             relevant_memories = [
                 item
