@@ -1,3 +1,4 @@
 mem0ai
 python-dotenv
 google-genai
+streamlit
