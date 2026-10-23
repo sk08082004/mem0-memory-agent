@@ -3,8 +3,10 @@ import copy
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -71,6 +73,36 @@ class FakeModels:
         if isinstance(response, Exception):
             raise response
         return FakeResponse(response)
+
+
+def fake_runtime_diagnostics(source_id=None, eligibility_report=None):
+    return {
+        "process_id": 123,
+        "graph_path": "temporary-graph.json",
+        "memory_fingerprint": "memory-hash",
+        "disk_fingerprint": "disk-hash",
+        "disk_error": None,
+        "node_count": 1,
+        "relationship_count": 0,
+        "recovery_record_count": 1,
+        "valid_recovery_record_count": 1,
+        "disk_node_count": 1,
+        "disk_relationship_count": 0,
+        "disk_recovery_record_count": 1,
+        "disk_valid_recovery_record_count": 1,
+        "source_node_exists": source_id is not None,
+        "source_record_exists": source_id is not None,
+        "source_record_valid": source_id is not None,
+        "source_record_status": "pending_generation" if source_id else None,
+        "source_record_attempts": 0 if source_id else None,
+        "source_eligible": (
+            source_id in eligibility_report.get("eligible", [])
+            if source_id is not None and eligibility_report is not None
+            else None
+        ),
+        "source_eligibility_reason": "eligible" if source_id else "not_requested",
+        "invalid_source_record": False,
+    }
 
 
 class FakeMemory:
@@ -1245,6 +1277,278 @@ class KnowledgeGraphTests(unittest.TestCase):
         with open(self.path, "rb") as graph_file:
             self.assertEqual(graph_file.read(), before_file)
 
+    def test_local_source_restore_atomically_adds_node_and_pending_record(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.add_node("user-a", "other-a", "Other A")
+        self.graph.add_node("user-a", "other-b", "Other B")
+        self.graph.add_relationship("user-a", "other-a", "other-b", "related")
+        self.graph.add_node("user-b", "private", "Private meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.graph.delete_node("user-a", "replacement")
+        before = copy.deepcopy(self.graph.graph)
+        old_record_before = copy.deepcopy(
+            before["user-a"]["relationship_recovery"]["old"]
+        )
+        save_calls = []
+        original_save = self.graph.save
+
+        def count_save(graph=None):
+            save_calls.append(copy.deepcopy(graph))
+            return original_save(graph)
+
+        with patch.object(self.graph, "save", side_effect=count_save):
+            result = self.graph.restore_local_recovery_source(
+                "user-a",
+                "replacement",
+                "Remote replacement text",
+            )
+
+        self.assertEqual(result, {"status": "restored"})
+        self.assertEqual(len(save_calls), 1)
+        user_graph = self.graph.get_user_graph("user-a")
+        self.assertIn(
+            {"id": "replacement", "memory_text": "Remote replacement text"},
+            user_graph["nodes"],
+        )
+        self.assertEqual(
+            user_graph["relationship_recovery"]["replacement"],
+            {
+                "source_id": "replacement",
+                "status": "pending_generation",
+                "attempts": 0,
+                "error": None,
+                "expected_edges": [],
+            },
+        )
+        self.assertEqual(
+            user_graph["relationship_recovery"]["old"],
+            old_record_before,
+        )
+        self.assertEqual(
+            user_graph["relationships"],
+            before["user-a"]["relationships"],
+        )
+        self.assertEqual(self.graph.graph["user-b"], before["user-b"])
+        persisted = KnowledgeGraph(self.path)
+        self.assertEqual(persisted.graph, self.graph.graph)
+
+    def test_local_source_restore_save_failure_preserves_memory_and_file(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.graph.delete_node("user-a", "replacement")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        with patch.object(self.graph, "save", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.graph.restore_local_recovery_source(
+                    "user-a",
+                    "replacement",
+                    "Remote replacement text",
+                )
+
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_graph_stale_snapshot_conflict_does_not_overwrite_newer_state(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.graph.delete_node("user-a", "replacement")
+        stale_graph = KnowledgeGraph(self.path)
+        current_graph = KnowledgeGraph(self.path)
+        current_graph.add_node("user-a", "newer-node", "Newer state")
+        with open(self.path, "rb") as graph_file:
+            newer_file = graph_file.read()
+        stale_memory = copy.deepcopy(stale_graph.graph)
+
+        with self.assertRaises(KnowledgeGraph.StateConflictError):
+            stale_graph.restore_local_recovery_source(
+                "user-a",
+                "replacement",
+                "Remote replacement text",
+            )
+
+        self.assertEqual(stale_graph.graph, stale_memory)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), newer_file)
+        persisted = KnowledgeGraph(self.path)
+        self.assertIn(
+            "newer-node",
+            {node["id"] for node in persisted.get_user_graph("user-a")["nodes"]},
+        )
+        self.assertNotIn(
+            "replacement",
+            {node["id"] for node in persisted.get_user_graph("user-a")["nodes"]},
+        )
+
+    def test_local_source_restore_requires_exact_superseded_provenance(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "different-replacement",
+            "Different replacement",
+        )
+        self.graph.delete_node("user-a", "different-replacement")
+        before = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        result = self.graph.restore_local_recovery_source(
+            "user-a",
+            "replacement",
+            "Remote replacement text",
+        )
+
+        self.assertEqual(result, {"status": "provenance_not_found"})
+        self.assertEqual(self.graph.graph, before)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_local_source_restore_preserves_existing_node_and_terminal_record(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "Existing replacement text",
+        )
+        self.graph.create_relationship_recovery("user-a", "replacement")
+        self.graph.begin_relationship_attempt("user-a", "replacement")
+        self.graph.finish_empty_relationship_recovery("user-a", "replacement")
+        before = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        result = self.graph.restore_local_recovery_source(
+            "user-a",
+            "replacement",
+            "New text must not overwrite",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "status": "already_present",
+                "node_exists": True,
+                "recovery_record_exists": True,
+            },
+        )
+        self.assertEqual(self.graph.graph, before)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_local_source_restore_refuses_existing_record_without_node(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.graph.delete_node("user-a", "replacement")
+        replacement_record = {
+            "source_id": "replacement",
+            "status": "failed",
+            "attempts": 2,
+            "error": "preserve",
+            "expected_edges": [],
+        }
+        self.graph.get_user_graph("user-a")[
+            "relationship_recovery"
+        ]["replacement"] = replacement_record
+        self.graph.save()
+        before = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        result = self.graph.restore_local_recovery_source(
+            "user-a",
+            "replacement",
+            "New text must not overwrite",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "status": "already_present",
+                "node_exists": False,
+                "recovery_record_exists": True,
+            },
+        )
+        self.assertEqual(self.graph.graph, before)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_local_source_restore_refuses_invalid_or_full_recovery_queue(self):
+        self.graph.add_node("user-a", "old", "Old meaning")
+        self.graph.create_relationship_recovery("user-a", "old")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.graph.delete_node("user-a", "replacement")
+        self.graph.get_user_graph("user-a")[
+            "relationship_recovery"
+        ]["broken"] = {"source_id": "wrong", "status": "pending_generation"}
+        self.graph.save()
+        before = copy.deepcopy(self.graph.graph)
+        result = self.graph.restore_local_recovery_source(
+            "user-a",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.assertEqual(result, {"status": "invalid_queue"})
+        self.assertEqual(self.graph.graph, before)
+
+        self.graph.get_user_graph("user-a")[
+            "relationship_recovery"
+        ].pop("broken")
+        queue = self.graph.get_user_graph("user-a")["relationship_recovery"]
+        for index in range(self.graph.MAX_RECOVERY_RECORDS - len(queue)):
+            source_id = f"queued-{index}"
+            queue[source_id] = {
+                "source_id": source_id,
+                "status": "pending_generation",
+                "attempts": 0,
+                "error": None,
+                "expected_edges": [],
+            }
+        self.graph.save()
+        before = copy.deepcopy(self.graph.graph)
+        result = self.graph.restore_local_recovery_source(
+            "user-a",
+            "replacement",
+            "Remote replacement text",
+        )
+        self.assertEqual(result, {"status": "queue_full"})
+        self.assertEqual(self.graph.graph, before)
+
     def test_replacement_reconciliation_is_user_scoped(self):
         self.graph.add_node("user-a", "old", "A old")
         self.graph.add_node("user-b", "old", "B old")
@@ -1306,6 +1610,166 @@ class KnowledgeGraphTests(unittest.TestCase):
         with open(self.path, "rb") as graph_file:
             self.assertEqual(graph_file.read(), original_contents)
 
+    def test_stale_graph_instance_cannot_overwrite_a_newer_save(self):
+        first = KnowledgeGraph(self.path)
+        stale = KnowledgeGraph(self.path)
+        first.add_node("user-a", "newer", "Newer state")
+        with open(self.path, "rb") as graph_file:
+            newer_contents = graph_file.read()
+        stale_snapshot = copy.deepcopy(stale.graph)
+        replacement = copy.deepcopy(stale.graph)
+        replacement["user-a"] = {
+            "nodes": [{"id": "stale", "memory_text": "Stale state"}],
+            "relationships": [],
+        }
+
+        with self.assertRaisesRegex(
+            KnowledgeGraph.StateConflictError,
+            "changed since it was loaded",
+        ):
+            stale.save(replacement)
+
+        self.assertEqual(stale.graph, stale_snapshot)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), newer_contents)
+        self.assertIn(
+            "newer",
+            {node["id"] for node in KnowledgeGraph(self.path)
+             .get_user_graph("user-a")["nodes"]},
+        )
+
+    def test_cross_process_graph_locks_serialize_writers(self):
+        marker_path = os.path.join(self.temp_dir.name, "lock-held")
+        lock_script = (
+            "import pathlib, sys, time\n"
+            "from app.graph import KnowledgeGraph\n"
+            "with KnowledgeGraph._file_lock(sys.argv[1]):\n"
+            " pathlib.Path(sys.argv[2]).write_text('ready')\n"
+            " time.sleep(0.6)\n"
+        )
+        wait_script = (
+            "import sys, time\n"
+            "from app.graph import KnowledgeGraph\n"
+            "start = time.monotonic()\n"
+            "with KnowledgeGraph._file_lock(sys.argv[1]):\n"
+            " elapsed = time.monotonic() - start\n"
+            "print(elapsed)\n"
+        )
+        first = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                lock_script,
+                self.path,
+                marker_path,
+            ],
+            cwd=os.getcwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not os.path.exists(marker_path):
+                if first.poll() is not None:
+                    stdout, stderr = first.communicate()
+                    self.fail(
+                        f"Lock holder exited early: {stdout} {stderr}"
+                    )
+                if time.monotonic() >= deadline:
+                    self.fail("Lock holder did not acquire the graph lock.")
+                time.sleep(0.01)
+
+            second = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    wait_script,
+                    self.path,
+                ],
+                cwd=os.getcwd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.15)
+            self.assertIsNone(second.poll(), "Second process bypassed the lock.")
+            first_stdout, first_stderr = first.communicate(timeout=5)
+            second_stdout, second_stderr = second.communicate(timeout=5)
+            self.assertEqual(first.returncode, 0, first_stderr or first_stdout)
+            self.assertEqual(second.returncode, 0, second_stderr or second_stdout)
+            self.assertGreaterEqual(float(second_stdout.strip()), 0.3)
+        finally:
+            if first.poll() is None:
+                first.wait(timeout=5)
+
+    def test_lock_timeout_preserves_persisted_and_in_memory_graph(self):
+        self.graph.add_node("user-a", "existing", "Existing state")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+        candidate = copy.deepcopy(self.graph.graph)
+        candidate["user-a"]["nodes"].append(
+            {"id": "candidate", "memory_text": "Candidate state"}
+        )
+        marker_path = os.path.join(self.temp_dir.name, "timeout-lock-held")
+        lock_script = (
+            "import pathlib, sys, time\n"
+            "from app.graph import KnowledgeGraph\n"
+            "with KnowledgeGraph._file_lock(sys.argv[1]):\n"
+            " pathlib.Path(sys.argv[2]).write_text('ready')\n"
+            " time.sleep(0.6)\n"
+        )
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                lock_script,
+                self.path,
+                marker_path,
+            ],
+            cwd=os.getcwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not os.path.exists(marker_path):
+                if holder.poll() is not None:
+                    stdout, stderr = holder.communicate()
+                    self.fail(f"Lock holder exited early: {stdout} {stderr}")
+                if time.monotonic() >= deadline:
+                    self.fail("Lock holder did not acquire the graph lock.")
+                time.sleep(0.01)
+
+            with patch.object(
+                KnowledgeGraph,
+                "FILE_LOCK_TIMEOUT_SECONDS",
+                0.1,
+            ):
+                with self.assertRaisesRegex(
+                    KnowledgeGraph.FileLockError,
+                    "Timed out",
+                ):
+                    self.graph.save(candidate)
+            self.assertEqual(self.graph.graph, before_graph)
+            with open(self.path, "rb") as graph_file:
+                self.assertEqual(graph_file.read(), before_file)
+        finally:
+            holder.communicate(timeout=5)
+
+    def test_repeated_saves_through_one_graph_instance_succeed(self):
+        self.graph.add_node("user-a", "first", "First")
+        self.graph.add_node("user-a", "second", "Second")
+        self.graph.save()
+        self.graph.save()
+        persisted = KnowledgeGraph(self.path)
+        self.assertEqual(
+            {node["id"] for node in persisted.get_user_graph("user-a")["nodes"]},
+            {"first", "second"},
+        )
+
 
 class RelationshipRecoveryTests(unittest.TestCase):
     def setUp(self):
@@ -1345,6 +1809,18 @@ class RelationshipRecoveryTests(unittest.TestCase):
     def add_source_and_target(self, source="source", target="target"):
         self.graph.add_node("user-a", source, "Source memory")
         self.graph.add_node("user-a", target, "Target memory")
+
+    def prepare_replacement_provenance(self):
+        self.graph.add_node("user-a", "old-source", "Old memory")
+        self.graph.add_node("user-a", "unrelated", "Unrelated memory")
+        self.graph.create_relationship_recovery("user-a", "old-source")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old-source",
+            "replacement",
+            "Replacement text",
+        )
+        self.graph.delete_node("user-a", "replacement")
 
     @staticmethod
     def pending_record(source_id):
@@ -1526,6 +2002,422 @@ class RelationshipRecoveryTests(unittest.TestCase):
         with open(self.path, "rb") as graph_file:
             self.assertEqual(graph_file.read(), before_file)
 
+    def test_restore_local_source_uses_exact_valid_remote_listing_and_no_mutation(self):
+        self.prepare_replacement_provenance()
+        self.graph.add_node("user-b", "private-node", "Private")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+        memory_calls = []
+        remote_text = "Verified replacement text"
+
+        def complete_listing(user_id):
+            memory_calls.append(("list", user_id))
+            return {
+                "count": 2,
+                "results": [
+                    {"id": "other", "memory": "Other remote text"},
+                    {"id": "replacement", "memory": remote_text},
+                ],
+            }
+
+        self.agent.memory.get_all_complete = complete_listing
+        self.agent.client = types.SimpleNamespace(models=FakeModels([]))
+        save_calls = []
+        original_save = self.graph.save
+
+        def count_save(graph=None):
+            save_calls.append(copy.deepcopy(graph))
+            return original_save(graph)
+
+        with patch.object(self.graph, "save", side_effect=count_save):
+            result = self.agent.restore_local_recovery_source("replacement")
+
+        self.assertEqual(
+            result,
+            {"status": "restored", "listing_count": 2},
+        )
+        self.assertEqual(memory_calls, [("list", "user-a")])
+        self.assertEqual(self.agent.client.models.calls, 0)
+        self.assertEqual(len(save_calls), 1)
+        self.assertEqual(self.graph.graph["user-b"], before_graph["user-b"])
+        user_graph = self.graph.get_user_graph("user-a")
+        self.assertIn(
+            {"id": "replacement", "memory_text": remote_text},
+            user_graph["nodes"],
+        )
+        self.assertEqual(
+            user_graph["relationship_recovery"]["old-source"],
+            before_graph["user-a"]["relationship_recovery"]["old-source"],
+        )
+        with open(self.path, "rb") as graph_file:
+            persisted = json.load(graph_file)
+        self.assertEqual(
+            persisted["user-a"]["relationship_recovery"]["replacement"]["status"],
+            "pending_generation",
+        )
+        self.assertNotEqual(self.graph.graph, before_graph)
+
+    def test_restore_local_source_rejects_untrusted_listing_without_writes(self):
+        listing_cases = (
+            ("missing", {"count": 1, "results": [{"id": "other", "memory": "Text"}]}),
+            (
+                "duplicate",
+                {
+                    "count": 2,
+                    "results": [
+                        {"id": "replacement", "memory": "Text"},
+                        {"id": "replacement", "memory": "Again"},
+                    ],
+                },
+            ),
+            ("incomplete", {"count": 2, "results": [{"id": "replacement", "memory": "Text"}]}),
+            ("malformed", {"count": 1, "results": [{"id": "replacement"}]}),
+            ("empty_text", {"count": 1, "results": [{"id": "replacement", "memory": "  "}]}),
+        )
+
+        for label, listing in listing_cases:
+            with self.subTest(label=label):
+                self.prepare_replacement_provenance()
+                before_graph = copy.deepcopy(self.graph.graph)
+                with open(self.path, "rb") as graph_file:
+                    before_file = graph_file.read()
+                self.agent.memory.get_all_complete = lambda user_id: listing
+
+                result = self.agent.restore_local_recovery_source("replacement")
+
+                expected_status = (
+                    "remote_source_not_found"
+                    if label == "missing"
+                    else "listing_inconclusive"
+                )
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(self.graph.graph, before_graph)
+                with open(self.path, "rb") as graph_file:
+                    self.assertEqual(graph_file.read(), before_file)
+
+    def test_restore_local_source_listing_exception_is_inconclusive(self):
+        self.prepare_replacement_provenance()
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        def fail_listing(user_id):
+            raise RuntimeError("private listing failure")
+
+        self.agent.memory.get_all_complete = fail_listing
+        result = self.agent.restore_local_recovery_source("replacement")
+
+        self.assertEqual(result, {"status": "listing_inconclusive"})
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_restore_local_source_preserves_existing_node_or_recovery_record(self):
+        self.prepare_replacement_provenance()
+        self.graph.add_node("user-a", "replacement", "Existing text")
+        self.agent.memory.get_all_complete = lambda user_id: {
+            "count": 1,
+            "results": [{"id": "replacement", "memory": "Remote text"}],
+        }
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        node_exists = self.agent.restore_local_recovery_source("replacement")
+
+        self.assertEqual(
+            node_exists,
+            {
+                "status": "already_present",
+                "node_exists": True,
+                "recovery_record_exists": False,
+                "listing_count": 1,
+            },
+        )
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_inspect_relationship_recovery_is_read_only_and_reports_eligible_record(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=AssertionError("inspection attempted graph persistence"),
+        ):
+            report = self.agent.inspect_relationship_recovery("source")
+
+        self.assertEqual(
+            report,
+            {
+                "node_exists": True,
+                "record_exists": True,
+                "record_valid": True,
+                "invalid_record": False,
+                "queue_valid": True,
+                "status": "pending_generation",
+                "attempts": 0,
+                "attempt_cap": self.agent.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT,
+                "attempt_cap_reached": False,
+                "eligible": True,
+                "reason": "eligible",
+                "node_count": 2,
+                "recovery_record_count": 1,
+                "valid_recovery_record_count": 1,
+            },
+        )
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_inspect_relationship_recovery_reports_missing_and_invalid_records(self):
+        self.graph.add_node("user-a", "node-without-record", "Node")
+        self.graph.add_node("user-a", "invalid-record-node", "Node")
+        self.graph.get_user_graph("user-a")["relationship_recovery"] = {
+            "invalid-record-node": {
+                "source_id": "invalid-record-node",
+                "status": "not-a-supported-status",
+                "attempts": 0,
+                "error": None,
+                "expected_edges": [],
+            }
+        }
+        self.graph.save()
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=AssertionError("inspection attempted graph persistence"),
+        ):
+            missing = self.agent.inspect_relationship_recovery(
+                "node-without-record"
+            )
+            missing_node = self.agent.inspect_relationship_recovery(
+                "absent-node"
+            )
+            invalid = self.agent.inspect_relationship_recovery(
+                "invalid-record-node"
+            )
+
+        self.assertTrue(missing["node_exists"])
+        self.assertFalse(missing["record_exists"])
+        self.assertEqual(missing["reason"], "recovery_record_not_found")
+        self.assertFalse(missing_node["node_exists"])
+        self.assertEqual(missing_node["reason"], "recovery_record_not_found")
+        self.assertTrue(invalid["node_exists"])
+        self.assertFalse(invalid["record_exists"])
+        self.assertTrue(invalid["invalid_record"])
+        self.assertEqual(invalid["reason"], "invalid_recovery_record")
+        self.assertFalse(invalid["eligible"])
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_runtime_diagnostic_fingerprints_are_stable_and_read_only(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+        with open(self.path, "rb") as graph_file:
+            file_before = graph_file.read()
+
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=AssertionError("diagnostics attempted persistence"),
+        ):
+            first = self.agent.relationship_runtime_diagnostics("source")
+            second = self.agent.relationship_runtime_diagnostics("source")
+
+        self.assertEqual(
+            first["memory_fingerprint"],
+            second["memory_fingerprint"],
+        )
+        self.assertEqual(first["disk_fingerprint"], second["disk_fingerprint"])
+        self.assertIsNotNone(first["memory_fingerprint"])
+        self.assertIsNotNone(first["disk_fingerprint"])
+        self.assertEqual(first["memory_fingerprint"], first["disk_fingerprint"])
+        self.assertEqual(first["node_count"], 2)
+        self.assertEqual(first["relationship_count"], 0)
+        self.assertEqual(first["recovery_record_count"], 1)
+        self.assertEqual(first["valid_recovery_record_count"], 1)
+        self.assertEqual(first["source_node_exists"], True)
+        self.assertEqual(first["source_record_valid"], True)
+        self.assertTrue(first["source_eligible"])
+        self.assertEqual(models.calls, 0)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), file_before)
+
+    def test_runtime_diagnostic_distinguishes_memory_and_disk_changes(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        baseline = self.agent.relationship_runtime_diagnostics("source")
+
+        self.graph.graph["user-a"]["nodes"].append(
+            {"id": "memory-only", "memory_text": "test"}
+        )
+        memory_changed = self.agent.relationship_runtime_diagnostics("source")
+        self.assertNotEqual(
+            baseline["memory_fingerprint"],
+            memory_changed["memory_fingerprint"],
+        )
+        self.assertEqual(
+            baseline["disk_fingerprint"],
+            memory_changed["disk_fingerprint"],
+        )
+
+        external_writer = KnowledgeGraph(self.path)
+        external_writer.add_node("user-a", "disk-only", "test")
+        disk_changed = self.agent.relationship_runtime_diagnostics("source")
+        self.assertEqual(
+            memory_changed["memory_fingerprint"],
+            disk_changed["memory_fingerprint"],
+        )
+        self.assertNotEqual(
+            memory_changed["disk_fingerprint"],
+            disk_changed["disk_fingerprint"],
+        )
+
+    def test_runtime_diagnostic_inspection_and_dry_run_agree_on_eligibility(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+
+        inspection = self.agent.inspect_relationship_recovery("source")
+        preview = self.agent.recover_relationships(dry_run=True)
+        diagnostics = self.agent.relationship_runtime_diagnostics(
+            "source",
+            preview,
+        )
+
+        self.assertTrue(inspection["eligible"])
+        self.assertIn("source", preview["eligible"])
+        self.assertEqual(
+            diagnostics["source_eligible"],
+            inspection["eligible"],
+        )
+        self.assertEqual(
+            diagnostics["source_eligibility_reason"],
+            "eligible",
+        )
+
+    def test_runtime_diagnostic_reports_invalid_disk_json_safely(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        with open(self.path, "w", encoding="utf-8") as graph_file:
+            graph_file.write("{invalid")
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        diagnostics = self.agent.relationship_runtime_diagnostics("source")
+
+        self.assertIsNone(diagnostics["disk_fingerprint"])
+        self.assertEqual(diagnostics["disk_error"], "invalid_json")
+        self.assertEqual(diagnostics["memory_fingerprint"] is None, False)
+        self.assertTrue(diagnostics["source_eligible"])
+        self.assertEqual(models.calls, 0)
+
+    def test_remote_memory_verification_requires_complete_valid_listing(self):
+        target_id = "remote-memory"
+        valid_memory = {"id": target_id, "memory": "Private text"}
+        test_cases = (
+            (
+                "present",
+                {"count": 1, "results": [valid_memory]},
+                {"found": True, "result": "found"},
+            ),
+            (
+                "absent",
+                {"count": 1, "results": [{"id": "other", "memory": "Text"}]},
+                {"found": False, "result": "absent"},
+            ),
+            (
+                "incomplete",
+                {"count": 2, "results": [valid_memory]},
+                {"found": None, "result": "inconclusive"},
+            ),
+            (
+                "invalid_item",
+                {"count": 1, "results": [{"id": target_id, "memory": "  "}]},
+                {"found": None, "result": "inconclusive"},
+            ),
+            (
+                "duplicate_ids",
+                {
+                    "count": 2,
+                    "results": [
+                        valid_memory,
+                        {"id": target_id, "memory": "Other text"},
+                    ],
+                },
+                {"found": None, "result": "inconclusive"},
+            ),
+        )
+
+        self.graph.add_node("user-a", "local-node", "Local graph text")
+        self.graph.create_relationship_recovery("user-a", "local-node")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        for label, listing, expected in test_cases:
+            with self.subTest(label=label):
+                self.agent.memory.get_all_complete = lambda user_id: listing
+                report = self.agent.verify_remote_memory(target_id)
+                self.assertEqual(report["found"], expected["found"])
+                self.assertEqual(report["result"], expected["result"])
+                self.assertEqual(
+                    report["listing_complete"],
+                    expected["found"] is not None,
+                )
+                self.assertEqual(
+                    report["listing_valid"],
+                    expected["found"] is not None,
+                )
+
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_remote_memory_verification_listing_failure_is_inconclusive(self):
+        self.graph.add_node("user-a", "local-node", "Local graph text")
+        self.graph.create_relationship_recovery("user-a", "local-node")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        def fail_listing(user_id):
+            raise OSError("private listing failure")
+
+        self.agent.memory.get_all_complete = fail_listing
+        report = self.agent.verify_remote_memory("remote-memory")
+
+        self.assertEqual(
+            report,
+            {
+                "found": None,
+                "listing_complete": False,
+                "listing_valid": False,
+                "memory_count": None,
+                "result_count": None,
+                "result": "inconclusive",
+            },
+        )
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
     def test_source_filtered_apply_leaves_other_recovery_sources_untouched(self):
         self.add_source_and_target("source", "target")
         self.graph.add_node("user-a", "other-source", "Other source")
@@ -1568,12 +2460,18 @@ class RelationshipRecoveryTests(unittest.TestCase):
         self.agent.client = types.SimpleNamespace(models=models)
 
         preview = self.agent.recover_relationships(dry_run=True)
+        inspection = self.agent.inspect_relationship_recovery(source_id)
         apply_report = self.agent.recover_relationships(
             dry_run=False,
             source_id=source_id,
         )
 
         self.assertIn(source_id, preview["eligible"])
+        self.assertTrue(inspection["eligible"])
+        self.assertEqual(
+            inspection["eligible"],
+            source_id in preview["eligible"],
+        )
         self.assertNotIn(
             {
                 "source_id": source_id,
@@ -1591,6 +2489,47 @@ class RelationshipRecoveryTests(unittest.TestCase):
         self.assertEqual(records[source_id]["status"], "succeeded")
         self.assertEqual(records["other-source"]["status"], "pending_generation")
         self.assertEqual(records["other-source"]["attempts"], 0)
+
+    def test_source_apply_fails_closed_when_disk_state_changed_before_apply(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        models = FakeModels([self.relationship_response()])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        preview = self.agent.recover_relationships(dry_run=True)
+        self.assertIn("source", preview["eligible"])
+
+        external_graph = KnowledgeGraph(self.path)
+        external_graph.add_node("user-a", "newer-node", "Newer state")
+        with open(self.path, "rb") as graph_file:
+            newer_file = graph_file.read()
+
+        apply_report = self.agent.recover_relationships(
+            dry_run=False,
+            source_id="source",
+        )
+
+        self.assertIn(
+            {
+                "source_id": "source",
+                "status": "state_changed",
+                "reason": (
+                    "Graph file changed since it was loaded; reload before writing."
+                ),
+            },
+            apply_report["details"],
+        )
+        self.assertEqual(apply_report["attempted"], 0)
+        self.assertEqual(models.calls, 0)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), newer_file)
+        self.assertNotIn(
+            "newer-node",
+            {
+                node["id"]
+                for node in self.graph.get_user_graph("user-a")["nodes"]
+            },
+        )
 
     def test_source_apply_reports_record_removed_after_preview_without_model_call(self):
         source_id = "588c27c5-4f7a-488d-ae9b-64e8067d2eff"
@@ -1619,6 +2558,33 @@ class RelationshipRecoveryTests(unittest.TestCase):
             },
             apply_report["details"],
         )
+        self.assertEqual(models.calls, 0)
+
+    def test_invalid_source_record_is_not_sent_to_model(self):
+        self.add_source_and_target()
+        self.graph.get_user_graph("user-a")[
+            "relationship_recovery"
+        ] = {
+            "source": {
+                "source_id": "source",
+                "status": "pending_generation",
+                "attempts": "invalid",
+                "error": None,
+                "expected_edges": [],
+            }
+        }
+        self.graph.save()
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        report = self.agent.recover_relationships(
+            dry_run=False,
+            source_id="source",
+        )
+
+        self.assertEqual(report["eligible"], [])
+        self.assertEqual(report["invalid_records"], ["source"])
+        self.assertEqual(report["attempted"], 0)
         self.assertEqual(models.calls, 0)
 
     def test_source_filtered_apply_respects_attempt_cap_and_missing_endpoint(self):
@@ -2304,6 +3270,13 @@ class CliAndSessionTests(unittest.TestCase):
                 self.memory = types.SimpleNamespace()
                 self.graph = types.SimpleNamespace()
 
+            def relationship_runtime_diagnostics(
+                self,
+                source_id=None,
+                eligibility_report=None,
+            ):
+                return fake_runtime_diagnostics(source_id, eligibility_report)
+
             def recover_relationships(self, dry_run=True):
                 calls.append(dry_run)
                 return {
@@ -2403,6 +3376,13 @@ class CliAndSessionTests(unittest.TestCase):
                 self.memory = types.SimpleNamespace()
                 self.graph = types.SimpleNamespace()
 
+            def relationship_runtime_diagnostics(
+                self,
+                source_id=None,
+                eligibility_report=None,
+            ):
+                return fake_runtime_diagnostics(source_id, eligibility_report)
+
             def enroll_relationship_recovery(self, source_id):
                 enrollment_calls.append(source_id)
                 return {"status": "enrolled"}
@@ -2451,6 +3431,177 @@ class CliAndSessionTests(unittest.TestCase):
         )
         self.assertIn("No generation was run.", output.getvalue())
         self.assertIn("Relationship recovery for source source:", output.getvalue())
+
+    def test_relationship_recovery_cli_inspect_source_is_read_only_route(self):
+        source_id = "source"
+        inspected = []
+        recovery_calls = []
+
+        class FakeAgent:
+            user_id = "user-a"
+            memory = types.SimpleNamespace()
+            graph = types.SimpleNamespace()
+
+            def inspect_relationship_recovery(self, requested_source):
+                inspected.append(requested_source)
+                return {
+                    "node_exists": True,
+                    "record_exists": True,
+                    "record_valid": True,
+                    "invalid_record": False,
+                    "queue_valid": True,
+                    "status": "pending_generation",
+                    "attempts": 0,
+                    "attempt_cap": 3,
+                    "attempt_cap_reached": False,
+                    "eligible": True,
+                    "reason": "eligible",
+                    "node_count": 2,
+                    "recovery_record_count": 1,
+                    "valid_recovery_record_count": 1,
+                }
+
+            def relationship_runtime_diagnostics(
+                self,
+                source_id=None,
+                eligibility_report=None,
+            ):
+                return fake_runtime_diagnostics(source_id, eligibility_report)
+
+            def recover_relationships(self, **kwargs):
+                recovery_calls.append(kwargs)
+                raise AssertionError("inspection must not run recovery")
+
+        agent = FakeAgent()
+        with patch.object(
+            main_module,
+            "create_agent",
+            return_value=agent,
+        ), patch.object(
+            main_module,
+            "load_user",
+            return_value="user-a",
+        ):
+            commands = iter(
+                [
+                    f"/recover-relationships --inspect-source {source_id}",
+                    "exit",
+                ]
+            )
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(inspected, [source_id])
+        self.assertEqual(recovery_calls, [])
+        self.assertIn("Status: pending_generation", output.getvalue())
+        self.assertIn("Eligible for recovery: True", output.getvalue())
+        self.assertIn("Read-only inspection; no changes were made.", output.getvalue())
+
+    def test_relationship_recovery_cli_verifies_remote_source_read_only(self):
+        source_id = "remote-memory"
+        models = FakeModels([])
+        agent = self.make_recovery_cli_agent("local-source", models)
+        listing_calls = []
+        private_text = "must not be shown"
+
+        def complete_listing(user_id):
+            listing_calls.append(user_id)
+            return {
+                "count": 1,
+                "results": [{"id": source_id, "memory": private_text}],
+            }
+
+        agent.memory.get_all_complete = complete_listing
+        with open(agent.graph.path_file, "rb") as graph_file:
+            graph_before = graph_file.read()
+        session_contents = '{"user_id": "user-a"}'
+        with open(self.session_path, "w", encoding="utf-8") as session_file:
+            session_file.write(session_contents)
+
+        with patch.object(
+            main_module,
+            "create_agent",
+            return_value=agent,
+        ), patch.object(
+            main_module,
+            "load_user",
+            return_value="user-a",
+        ):
+            commands = iter(
+                [
+                    f"/recover-relationships --verify-remote-source {source_id}",
+                    "exit",
+                ]
+            )
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        with open(agent.graph.path_file, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), graph_before)
+        with open(self.session_path, encoding="utf-8") as session_file:
+            self.assertEqual(session_file.read(), session_contents)
+        self.assertEqual(listing_calls, ["user-a"])
+        self.assertEqual(models.calls, 0)
+        self.assertIn("Listing complete: True", output.getvalue())
+        self.assertIn("Listing validated: True", output.getvalue())
+        self.assertIn("Exact memory ID found: True", output.getvalue())
+        self.assertIn("Reported memory count: 1", output.getvalue())
+        self.assertNotIn(private_text, output.getvalue())
+        self.assertNotIn("Local graph text", output.getvalue())
+
+    def test_relationship_recovery_cli_routes_restore_local_source(self):
+        calls = []
+
+        class FakeAgent:
+            user_id = "user-a"
+            memory = types.SimpleNamespace()
+            graph = types.SimpleNamespace()
+
+            def restore_local_recovery_source(self, source_id):
+                calls.append(source_id)
+                return {"status": "restored", "listing_count": 2}
+
+            def relationship_runtime_diagnostics(
+                self,
+                source_id=None,
+                eligibility_report=None,
+            ):
+                return fake_runtime_diagnostics(source_id, eligibility_report)
+
+        with patch.object(
+            main_module,
+            "create_agent",
+            return_value=FakeAgent(),
+        ), patch.object(
+            main_module,
+            "load_user",
+            return_value="user-a",
+        ):
+            commands = iter(
+                [
+                    "/recover-relationships --restore-local-source replacement",
+                    "exit",
+                ]
+            )
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(calls, ["replacement"])
+        self.assertIn("restored", output.getvalue())
+        self.assertIn("Validated remote listing count: 2", output.getvalue())
+        self.assertIn("No Mem0 mutation or Gemini generation", output.getvalue())
 
     def test_cli_preview_then_source_apply_uses_same_agent_graph_and_queue(self):
         source_id = "588c27c5-4f7a-488d-ae9b-64e8067d2eff"
@@ -2520,13 +3671,14 @@ class CliAndSessionTests(unittest.TestCase):
                 main()
 
         self.assertEqual(created_users, ["user-a"])
-        self.assertEqual(len(observations), 2)
+        self.assertEqual(len(observations), 3)
         self.assertEqual(observations[0]["user_id"], observations[1]["user_id"])
         self.assertIs(observations[0]["graph"], observations[1]["graph"])
         self.assertIs(observations[0]["graph"], agent.graph)
         self.assertEqual(observations[0]["queue"], observations[1]["queue"])
         self.assertEqual(observations[0]["queue_record"], observations[1]["queue_record"])
         self.assertEqual(observations[0]["queue_record"]["status"], "pending_generation")
+        self.assertEqual(observations[2]["queue_record"]["status"], "succeeded_empty")
         self.assertIn(source_id, output.getvalue())
         self.assertIn("Eligible source IDs: ['" + source_id + "']", output.getvalue())
         self.assertIn("Attempted: 1", output.getvalue())
@@ -2585,8 +3737,9 @@ class CliAndSessionTests(unittest.TestCase):
             ), contextlib.redirect_stdout(output):
                 main()
 
-        self.assertEqual(len(observations), 2)
+        self.assertEqual(len(observations), 3)
         self.assertIs(observations[0], observations[1])
+        self.assertIs(observations[1], observations[2])
         self.assertIn("Eligible source IDs: ['" + source_id + "']", output.getvalue())
         self.assertIn(f"- {source_id}: recovery_record_not_found", output.getvalue())
         self.assertIn("Attempted: 0", output.getvalue())

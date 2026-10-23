@@ -1,8 +1,12 @@
 import copy
+import contextlib
+import errno
+import hashlib
 import json
 import os
 import tempfile
 import threading
+import time
 
 from app.performance import timed_operation
 
@@ -13,6 +17,8 @@ class KnowledgeGraph:
     MAX_RECOVERY_ATTEMPTS = 3
     MAX_EXPECTED_EDGES = 10
     MAX_RECOVERY_ERROR_LENGTH = 240
+    FILE_LOCK_TIMEOUT_SECONDS = 5
+    FILE_LOCK_POLL_SECONDS = 0.05
     RECOVERY_STATUSES = {
         "pending_generation",
         "pending_persistence",
@@ -23,9 +29,16 @@ class KnowledgeGraph:
         "blocked_missing_endpoint",
     }
 
+    class StateConflictError(RuntimeError):
+        """Raised when the graph file changed since this instance loaded it."""
+
+    class FileLockError(RuntimeError):
+        """Raised when the graph file lock cannot be acquired or released."""
+
     def __init__(self, file_path="graph.json"):
-        self.path_file = file_path
+        self.path_file = os.path.realpath(os.path.abspath(file_path))
         self._lock = threading.RLock()
+        self._file_version = None
         self.graph = self._load()
 
     def _load(self):
@@ -33,8 +46,10 @@ class KnowledgeGraph:
             return {}
 
         try:
-            with open(self.path_file, "r", encoding="utf-8") as file:
-                return json.load(file)
+            with open(self.path_file, "rb") as file:
+                contents = file.read()
+            self._file_version = hashlib.sha256(contents).digest()
+            return json.loads(contents.decode("utf-8"))
 
         except (json.JSONDecodeError, OSError) as e:
             print(
@@ -42,37 +57,130 @@ class KnowledgeGraph:
             )
             return {}
 
+    def _current_file_version(self):
+        try:
+            with open(self.path_file, "rb") as file:
+                return hashlib.sha256(file.read()).digest()
+        except FileNotFoundError:
+            return None
+
+    def _ensure_file_version_matches(self):
+        if self._current_file_version() != self._file_version:
+            raise self.StateConflictError(
+                "Graph file changed since it was loaded; reload before writing."
+            )
+
+    @classmethod
+    @contextlib.contextmanager
+    def _file_lock(cls, graph_path):
+        lock_path = os.path.realpath(os.path.abspath(graph_path)) + ".lock"
+        try:
+            lock_file = open(lock_path, "a+b")
+        except OSError as error:
+            raise cls.FileLockError(
+                "Could not open the graph file lock."
+            ) from error
+        locked = False
+        try:
+            try:
+                if os.fstat(lock_file.fileno()).st_size == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+            except OSError as error:
+                raise cls.FileLockError(
+                    "Could not initialize the graph file lock."
+                ) from error
+            deadline = time.monotonic() + cls.FILE_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    lock_file.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(
+                            lock_file.fileno(),
+                            fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
+                    locked = True
+                    break
+                except OSError as error:
+                    contention_errors = {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EDEADLK,
+                    }
+                    if (
+                        error.errno not in contention_errors
+                        and getattr(error, "winerror", None) not in {33, 36}
+                    ):
+                        raise cls.FileLockError(
+                            "Could not acquire the graph file lock."
+                        ) from error
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise cls.FileLockError(
+                            "Timed out waiting for the graph file lock."
+                        ) from error
+                    time.sleep(min(cls.FILE_LOCK_POLL_SECONDS, remaining))
+            yield
+        finally:
+            if locked:
+                try:
+                    lock_file.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(
+                            lock_file.fileno(),
+                            msvcrt.LK_UNLCK,
+                            1,
+                        )
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError as error:
+                    lock_file.close()
+                    raise cls.FileLockError(
+                        "Could not release the graph file lock."
+                    ) from error
+            lock_file.close()
+
     def save(self, graph=None):
         with timed_operation("Graph persistence"):
             return self._save(graph)
 
     def _save(self, graph=None):
         with self._lock:
-            graph_to_save = self.graph if graph is None else graph
-            directory = os.path.dirname(os.path.abspath(self.path_file))
-            descriptor, temporary_path = tempfile.mkstemp(
-                prefix=".graph-",
-                suffix=".tmp",
-                dir=directory
-            )
-            try:
-                with os.fdopen(
-                    descriptor,
-                    "w",
-                    encoding="utf-8"
-                ) as file:
-                    json.dump(
-                        graph_to_save,
-                        file,
-                        indent=2
-                    )
-                os.replace(temporary_path, self.path_file)
-            except Exception:
+            with self._file_lock(self.path_file):
+                self._ensure_file_version_matches()
+                graph_to_save = copy.deepcopy(
+                    self.graph if graph is None else graph
+                )
+                contents = json.dumps(graph_to_save, indent=2).encode("utf-8")
+                directory = os.path.dirname(self.path_file)
+                descriptor, temporary_path = tempfile.mkstemp(
+                    prefix=".graph-",
+                    suffix=".tmp",
+                    dir=directory
+                )
                 try:
-                    os.unlink(temporary_path)
-                except FileNotFoundError:
-                    pass
-                raise
+                    with os.fdopen(descriptor, "wb") as file:
+                        file.write(contents)
+                    self._ensure_file_version_matches()
+                    os.replace(temporary_path, self.path_file)
+                except Exception:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+                    raise
+                self.graph = graph_to_save
+                self._file_version = hashlib.sha256(contents).digest()
 
     def _commit_user_graph(self, user_id, user_graph):
         updated_graph = dict(self.graph)
@@ -134,6 +242,86 @@ class KnowledgeGraph:
             return False
         return True
 
+    def restore_local_recovery_source(
+        self,
+        user_id,
+        replacement_id,
+        memory_text,
+    ):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or not isinstance(replacement_id, str)
+            or not replacement_id.strip()
+            or len(replacement_id) > 256
+            or not isinstance(memory_text, str)
+            or not memory_text.strip()
+        ):
+            return {"status": "invalid_input"}
+
+        with self._lock:
+            try:
+                user_graph = self._user_graph_copy(user_id)
+            except ValueError:
+                return {"status": "invalid_user_graph"}
+
+            recovery = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY, {})
+            if not isinstance(recovery, dict):
+                return {"status": "invalid_queue"}
+            if len(recovery) > self.MAX_RECOVERY_RECORDS:
+                return {"status": "invalid_queue"}
+            if any(
+                not self._valid_recovery_record(record)
+                or key != record.get("source_id")
+                for key, record in recovery.items()
+            ):
+                return {"status": "invalid_queue"}
+
+            provenance_records = [
+                record
+                for key, record in recovery.items()
+                if (
+                    key == record.get("source_id")
+                    and record["status"] == "superseded"
+                    and record.get("replacement_id") == replacement_id
+                )
+            ]
+            if len(provenance_records) != 1:
+                return {"status": "provenance_not_found"}
+
+            node_exists = replacement_id in self._node_ids(user_graph)
+            recovery_exists = replacement_id in recovery
+            if node_exists or recovery_exists:
+                return {
+                    "status": "already_present",
+                    "node_exists": node_exists,
+                    "recovery_record_exists": recovery_exists,
+                }
+
+            if len(recovery) >= self.MAX_RECOVERY_RECORDS:
+                return {"status": "queue_full"}
+
+            user_graph["nodes"].append(
+                {
+                    "id": replacement_id,
+                    "memory_text": memory_text,
+                }
+            )
+            recovery[replacement_id] = {
+                "source_id": replacement_id,
+                "status": "pending_generation",
+                "attempts": 0,
+                "error": None,
+                "expected_edges": [],
+            }
+            user_graph[self.RELATIONSHIP_RECOVERY_KEY] = recovery
+
+            updated_graph = dict(self.graph)
+            updated_graph[user_id] = user_graph
+            self.save(updated_graph)
+            self.graph = updated_graph
+            return {"status": "restored"}
+
     def _user_graph_copy(self, user_id):
         current = self.graph.get(
             user_id,
@@ -162,9 +350,10 @@ class KnowledgeGraph:
             )
         }
 
-    def get_relationship_recovery(self, user_id):
+    def get_relationship_recovery(self, user_id, user_graph=None):
         with self._lock:
-            user_graph = self.graph.get(user_id, {})
+            if user_graph is None:
+                user_graph = self.graph.get(user_id, {})
             if not isinstance(user_graph, dict):
                 return {
                     "valid": False,
@@ -258,12 +447,20 @@ class KnowledgeGraph:
         self,
         user_id,
         source_id,
-        max_attempts=MAX_RECOVERY_ATTEMPTS
+        max_attempts=MAX_RECOVERY_ATTEMPTS,
+        expected_user_graph=None,
     ):
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer.")
         max_attempts = min(max_attempts, self.MAX_RECOVERY_ATTEMPTS)
         with self._lock:
+            if (
+                expected_user_graph is not None
+                and self.graph.get(user_id, {}) != expected_user_graph
+            ):
+                raise self.StateConflictError(
+                    "Recovery state changed after eligibility was evaluated."
+                )
             user_graph = self._user_graph_copy(user_id)
             queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
             record = queue.get(source_id) if isinstance(queue, dict) else None
@@ -371,8 +568,20 @@ class KnowledgeGraph:
             self._commit_user_graph(user_id, user_graph)
             return True
 
-    def complete_relationship_recovery(self, user_id, source_id):
+    def complete_relationship_recovery(
+        self,
+        user_id,
+        source_id,
+        expected_user_graph=None,
+    ):
         with self._lock:
+            if (
+                expected_user_graph is not None
+                and self.graph.get(user_id, {}) != expected_user_graph
+            ):
+                raise self.StateConflictError(
+                    "Recovery state changed after eligibility was evaluated."
+                )
             user_graph = self._user_graph_copy(user_id)
             queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
             record = queue.get(source_id) if isinstance(queue, dict) else None

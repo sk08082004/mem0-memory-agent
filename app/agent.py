@@ -1,6 +1,8 @@
 import os
 import logging
 import json
+import copy
+import hashlib
 from platform import node
 import traceback
 
@@ -722,11 +724,18 @@ User message:
             raise ValueError("Relationship response exceeds the edge limit.")
         return relationships
 
-    def _generate_tracked_relationships(self, memory_id, attempt_limit):
+    def _generate_tracked_relationships(
+        self,
+        memory_id,
+        attempt_limit,
+        expected_user_graph=None,
+        on_attempt_started=None,
+    ):
         attempt = self.graph.begin_relationship_attempt(
             self.user_id,
             memory_id,
-            attempt_limit
+            attempt_limit,
+            expected_user_graph=expected_user_graph,
         )
         if attempt["status"] != "ready":
             print(
@@ -734,6 +743,8 @@ User message:
                 f"started: {attempt['status']}."
             )
             return False
+        if on_attempt_started is not None:
+            on_attempt_started()
 
         try:
             edges = self._generate_relationship_edges(memory_id)
@@ -797,6 +808,177 @@ User message:
             )
             return False
 
+    def _relationship_recovery_snapshot(self):
+        with self.graph._lock:
+            user_graph = copy.deepcopy(
+                self.graph.graph.get(self.user_id, {})
+            )
+            recovery = self.graph.get_relationship_recovery(
+                self.user_id,
+                user_graph=user_graph,
+            )
+        return user_graph, recovery
+
+    def _evaluate_relationship_recovery(
+        self,
+        user_graph,
+        recovery,
+        source_filter,
+        attempt_limit,
+    ):
+        eligible = []
+        details = []
+        capped = []
+        blocked = 0
+        if not recovery["valid"]:
+            return {
+                "eligible": eligible,
+                "details": details,
+                "capped": capped,
+                "blocked": recovery["blocked_count"],
+                "invalid_records": recovery["invalid_records"],
+            }
+
+        graph_nodes = (
+            user_graph.get("nodes", [])
+            if isinstance(user_graph, dict)
+            else []
+        )
+        node_ids = {
+            node["id"]
+            for node in graph_nodes
+            if (
+                isinstance(graph_nodes, list)
+                and isinstance(node, dict)
+                and isinstance(node.get("id"), str)
+                and node["id"].strip()
+            )
+        } if isinstance(graph_nodes, list) else set()
+
+        def endpoint_details(record, status, reason=None):
+            record_source_id = record["source_id"]
+            expected_edges = record.get("expected_edges", [])
+            missing_target_ids = []
+            if isinstance(expected_edges, list):
+                missing_target_ids = sorted(
+                    {
+                        edge["target_id"]
+                        for edge in expected_edges
+                        if (
+                            isinstance(edge, dict)
+                            and isinstance(edge.get("target_id"), str)
+                            and edge["target_id"] not in node_ids
+                        )
+                    }
+                )
+            detail = {
+                "source_id": record_source_id,
+                "status": status,
+                "missing_source_ids": (
+                    [record_source_id]
+                    if record_source_id not in node_ids
+                    else []
+                ),
+                "missing_target_ids": missing_target_ids,
+            }
+            if reason:
+                detail["reason"] = reason
+            replacement_id = record.get("replacement_id")
+            if isinstance(replacement_id, str) and replacement_id.strip():
+                detail["replacement_id"] = replacement_id
+            return detail
+
+        for record in recovery["records"]:
+            status = record["status"]
+            record_source_id = record["source_id"]
+            if (
+                source_filter is not None
+                and source_filter != record_source_id
+            ):
+                continue
+            if status in {"succeeded", "succeeded_empty"}:
+                continue
+            if status == "superseded":
+                details.append(
+                    endpoint_details(record, status, record.get("error"))
+                )
+                continue
+            if status == "blocked_missing_endpoint":
+                blocked += 1
+                details.append(
+                    endpoint_details(record, status, record.get("error"))
+                )
+                continue
+            if record_source_id not in node_ids:
+                blocked += 1
+                details.append(
+                    endpoint_details(
+                        record,
+                        "blocked_missing_endpoint",
+                        "Source node is missing.",
+                    )
+                )
+                continue
+            expected = record.get("expected_edges", [])
+            missing_target = (
+                status == "pending_persistence"
+                and (
+                    not isinstance(expected, list)
+                    or any(
+                        not isinstance(edge, dict)
+                        or edge.get("target_id") not in node_ids
+                        for edge in expected
+                    )
+                )
+            )
+            if missing_target:
+                blocked += 1
+                details.append(
+                    endpoint_details(
+                        record,
+                        "blocked_missing_endpoint",
+                        "One or more target nodes are missing.",
+                    )
+                )
+                continue
+            if status not in {
+                "pending_generation",
+                "failed",
+                "pending_persistence",
+            }:
+                blocked += 1
+                details.append(
+                    {
+                        "source_id": record_source_id,
+                        "status": "blocked_invalid_record",
+                        "reason": "Unsupported recovery status.",
+                    }
+                )
+                continue
+            if (
+                status in {"pending_generation", "failed"}
+                and record["attempts"] >= attempt_limit
+            ):
+                capped.append(record_source_id)
+                continue
+            eligible.append(record)
+
+        return {
+            "eligible": eligible,
+            "details": details,
+            "capped": capped,
+            "blocked": blocked,
+            "invalid_records": (
+                [
+                    invalid_id
+                    for invalid_id in recovery["invalid_records"]
+                    if invalid_id == source_filter
+                ]
+                if source_filter is not None
+                else recovery["invalid_records"]
+            ),
+        }
+
     def recover_relationships(
         self,
         dry_run=True,
@@ -816,9 +998,10 @@ User message:
         batch_limit = min(batch_limit, self.RELATIONSHIP_RECOVERY_BATCH_LIMIT)
         attempt_limit = min(
             attempt_limit,
-            self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT
+            self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT,
+            self.graph.MAX_RECOVERY_ATTEMPTS,
         )
-        recovery = self.graph.get_relationship_recovery(self.user_id)
+        user_graph, recovery = self._relationship_recovery_snapshot()
         report = {
             "dry_run": dry_run,
             "batch_limit": batch_limit,
@@ -840,151 +1023,36 @@ User message:
             report["error"] = recovery["error"]
             report["blocked"] = recovery["blocked_count"]
             return report
-        if source_filter is not None:
-            report["invalid_records"] = [
-                invalid_id
-                for invalid_id in recovery["invalid_records"]
-                if invalid_id == source_filter
-            ]
-            report["blocked"] = len(report["invalid_records"])
-
-        current_user_graph = self.graph.graph.get(self.user_id, {})
-        graph_nodes = (
-            current_user_graph.get("nodes", [])
-            if isinstance(current_user_graph, dict)
-            else []
+        evaluation = self._evaluate_relationship_recovery(
+            user_graph,
+            recovery,
+            source_filter,
+            attempt_limit,
         )
-        node_ids = {
-            node.get("id")
-            for node in graph_nodes
-            if (
-                isinstance(node, dict)
-                and isinstance(node.get("id"), str)
-                and node["id"].strip()
-            )
-        }
-
-        def endpoint_details(record, status, reason=None):
-            source_id = record["source_id"]
-            expected_edges = record.get("expected_edges", [])
-            missing_target_ids = []
-            if isinstance(expected_edges, list):
-                missing_target_ids = sorted(
-                    {
-                        edge["target_id"]
-                        for edge in expected_edges
-                        if (
-                            isinstance(edge, dict)
-                            and isinstance(edge.get("target_id"), str)
-                            and edge["target_id"] not in node_ids
-                        )
-                    }
-                )
-            detail = {
-                "source_id": source_id,
-                "status": status,
-                "missing_source_ids": (
-                    [source_id] if source_id not in node_ids else []
-                ),
-                "missing_target_ids": missing_target_ids,
-            }
-            if reason:
-                detail["reason"] = reason
-            replacement_id = record.get("replacement_id")
-            if isinstance(replacement_id, str) and replacement_id.strip():
-                detail["replacement_id"] = replacement_id
-            return detail
-
-        eligible = []
-        for record in recovery["records"]:
-            status = record["status"]
-            source_id = record["source_id"]
-            if source_filter is not None and source_filter != source_id:
-                continue
-            if status in {"succeeded", "succeeded_empty"}:
-                continue
-            if status == "superseded":
-                report["details"].append(
-                    endpoint_details(record, status, record.get("error"))
-                )
-                continue
-            if status == "blocked_missing_endpoint":
-                report["blocked"] += 1
-                report["details"].append(
-                    endpoint_details(record, status, record.get("error"))
-                )
-                continue
-            if source_id not in node_ids:
-                report["blocked"] += 1
-                report["details"].append(
-                    endpoint_details(
-                        record,
-                        "blocked_missing_endpoint",
-                        "Source node is missing.",
-                    )
-                )
-                if not dry_run:
-                    try:
-                        self.graph.set_relationship_recovery_status(
-                            self.user_id,
-                            source_id,
-                            "blocked_missing_endpoint",
-                            "Source node is missing."
-                        )
-                    except Exception as e:
-                        report["details"][-1]["reason"] = str(e)
-                continue
-            expected = record.get("expected_edges", [])
-            missing_target = (
-                status == "pending_persistence"
-                and (
-                    not isinstance(expected, list)
-                    or any(
-                        not isinstance(edge, dict)
-                        or edge.get("target_id") not in node_ids
-                        for edge in expected
-                    )
-                )
-            )
-            if missing_target:
-                report["blocked"] += 1
-                report["details"].append(
-                    endpoint_details(
-                        record,
-                        "blocked_missing_endpoint",
-                        "One or more target nodes are missing.",
-                    )
-                )
-                if not dry_run:
-                    try:
-                        self.graph.set_relationship_recovery_status(
-                            self.user_id,
-                            source_id,
-                            "blocked_missing_endpoint",
-                            "One or more target nodes are missing."
-                        )
-                    except Exception as e:
-                        report["details"][-1]["reason"] = str(e)
-                continue
-            if status not in {"pending_generation", "failed", "pending_persistence"}:
-                report["blocked"] += 1
-                report["details"].append(
-                    {
-                        "source_id": source_id,
-                        "status": "blocked_invalid_record",
-                        "reason": "Unsupported recovery status.",
-                    }
-                )
-                continue
-            if (
-                status in {"pending_generation", "failed"}
-                and record["attempts"] >= attempt_limit
-            ):
-                report["capped"].append(source_id)
-                continue
-            eligible.append(record)
-
+        report["invalid_records"] = evaluation["invalid_records"]
+        eligible = evaluation["eligible"]
         report["eligible"] = [record["source_id"] for record in eligible]
+        report["details"].extend(evaluation["details"])
+        report["capped"] = evaluation["capped"]
+        report["blocked"] += evaluation["blocked"]
+        if source_filter is not None:
+            report["blocked"] += len(report["invalid_records"])
+
+        if not dry_run:
+            for detail in evaluation["details"]:
+                if detail["status"] != "blocked_missing_endpoint":
+                    continue
+                source_to_block = detail["source_id"]
+                try:
+                    self.graph.set_relationship_recovery_status(
+                        self.user_id,
+                        source_to_block,
+                        "blocked_missing_endpoint",
+                        detail.get("reason") or "A source or target node is missing.",
+                    )
+                except Exception as error:
+                    detail["reason"] = str(error)
+
         if source_filter is not None and not any(
             record["source_id"] == source_filter
             for record in recovery["records"]
@@ -1004,14 +1072,68 @@ User message:
 
         for record in eligible[:batch_limit]:
             source_id = record["source_id"]
-            report["attempted"] += 1
-            status = record["status"]
             try:
+                current_user_graph, current_recovery = (
+                    self._relationship_recovery_snapshot()
+                )
+                current_evaluation = self._evaluate_relationship_recovery(
+                    current_user_graph,
+                    current_recovery,
+                    source_id,
+                    attempt_limit,
+                )
+                current_record = next(
+                    (
+                        candidate
+                        for candidate in current_evaluation["eligible"]
+                        if candidate["source_id"] == source_id
+                    ),
+                    None,
+                )
+                if (
+                    source_filter is not None
+                    and current_user_graph != user_graph
+                ):
+                    report["details"].append(
+                        {
+                            "source_id": source_id,
+                            "status": "state_changed",
+                            "reason": (
+                                "Recovery state changed after eligibility "
+                                "was evaluated."
+                            ),
+                        }
+                    )
+                    continue
+                if current_record is None:
+                    report["blocked"] += current_evaluation["blocked"]
+                    report["capped"].extend(current_evaluation["capped"])
+                    report["details"].extend(current_evaluation["details"])
+                    if not current_recovery["valid"]:
+                        report["error"] = current_recovery["error"]
+                    elif not any(
+                        detail.get("source_id") == source_id
+                        for detail in current_evaluation["details"]
+                    ):
+                        report["details"].append(
+                            {
+                                "source_id": source_id,
+                                "status": "state_changed",
+                                "reason": (
+                                    "Recovery record is no longer eligible."
+                                ),
+                            }
+                        )
+                    continue
+
+                status = current_record["status"]
                 if status == "pending_persistence":
                     result = self.graph.complete_relationship_recovery(
                         self.user_id,
-                        source_id
+                        source_id,
+                        expected_user_graph=current_user_graph,
                     )
+                    report["attempted"] += 1
                     if result["status"] == "succeeded":
                         report["succeeded"] += 1
                         report["details"].append(
@@ -1045,7 +1167,12 @@ User message:
                 else:
                     was_successful = self._generate_tracked_relationships(
                         source_id,
-                        attempt_limit
+                        attempt_limit,
+                        expected_user_graph=current_user_graph,
+                        on_attempt_started=lambda: report.__setitem__(
+                            "attempted",
+                            report["attempted"] + 1,
+                        ),
                     )
                     updated = self.graph.get_relationship_recovery(
                         self.user_id
@@ -1107,6 +1234,14 @@ User message:
                                 ),
                             }
                         )
+            except self.graph.StateConflictError as e:
+                report["details"].append(
+                    {
+                        "source_id": source_id,
+                        "status": "state_changed",
+                        "reason": str(e),
+                    }
+                )
             except Exception as e:
                 report["pending"] += 1
                 report["details"].append(
@@ -1197,6 +1332,462 @@ User message:
             }
 
         return {"status": "enrolled"}
+
+    def inspect_relationship_recovery(self, source_id):
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError("source_id must be a non-empty string.")
+
+        user_graph, recovery = self._relationship_recovery_snapshot()
+        nodes = (
+            user_graph.get("nodes", [])
+            if isinstance(user_graph, dict)
+            else []
+        )
+        if not isinstance(nodes, list):
+            nodes = []
+        node_ids = {
+            node.get("id")
+            for node in nodes
+            if (
+                isinstance(node, dict)
+                and isinstance(node.get("id"), str)
+                and node["id"].strip()
+            )
+        }
+        node_exists = source_id in node_ids
+
+        record_evaluation = self._evaluate_relationship_recovery(
+            user_graph,
+            recovery,
+            source_id,
+            min(
+                self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT,
+                self.graph.MAX_RECOVERY_ATTEMPTS,
+            ),
+        )
+        record = next(
+            (
+                item for item in recovery["records"]
+                if item["source_id"] == source_id
+            ),
+            None,
+        )
+        invalid_record = source_id in record_evaluation["invalid_records"]
+        attempt_cap = min(
+            self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT,
+            self.graph.MAX_RECOVERY_ATTEMPTS,
+        )
+        record_status = record["status"] if record else None
+        attempts = record["attempts"] if record else None
+        cap_reached = bool(
+            record
+            and record_status in {"pending_generation", "failed"}
+            and attempts >= attempt_cap
+        )
+        eligibility = {
+            "error": recovery["error"] if not recovery["valid"] else None,
+            "eligible": [
+                item["source_id"]
+                for item in record_evaluation["eligible"]
+            ],
+            "capped": record_evaluation["capped"],
+            "details": record_evaluation["details"],
+        }
+        eligible = source_id in eligibility["eligible"]
+        reason = self._relationship_eligibility_reason(
+            source_id,
+            eligibility,
+            record,
+            invalid_record,
+            node_exists,
+        )
+
+        return {
+            "node_exists": node_exists,
+            "record_exists": record is not None,
+            "record_valid": record is not None,
+            "invalid_record": invalid_record,
+            "queue_valid": recovery["valid"],
+            "status": record_status,
+            "attempts": attempts,
+            "attempt_cap": attempt_cap,
+            "attempt_cap_reached": cap_reached,
+            "eligible": eligible,
+            "reason": reason,
+            "node_count": len(nodes),
+            "recovery_record_count": recovery["queue_size"],
+            "valid_recovery_record_count": len(recovery["records"]),
+        }
+
+    @staticmethod
+    def _relationship_eligibility_reason(
+        source_id,
+        report,
+        record=None,
+        invalid_record=False,
+        node_exists=True,
+    ):
+        if report.get("error"):
+            return "invalid_recovery_queue"
+        if source_id in report.get("eligible", []):
+            return "eligible"
+        if source_id in report.get("capped", []):
+            return "attempt_cap_reached"
+        if invalid_record:
+            return "invalid_recovery_record"
+        if record is None:
+            return "recovery_record_not_found"
+        if record["status"] in {"succeeded", "succeeded_empty", "superseded"}:
+            return "record_not_eligible"
+        if not node_exists:
+            return "source_node_missing"
+        for detail in report.get("details", []):
+            if detail.get("source_id") != source_id:
+                continue
+            if detail.get("missing_target_ids"):
+                return "target_node_missing"
+            if detail.get("status") == "blocked_missing_endpoint":
+                return "blocked_missing_endpoint"
+            if detail.get("status") == "blocked_invalid_record":
+                return "blocked_invalid_record"
+        return "not_eligible"
+
+    @staticmethod
+    def _diagnostic_fingerprint(snapshot):
+        try:
+            canonical = json.dumps(
+                snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(canonical).hexdigest()[:12]
+
+    def relationship_runtime_diagnostics(
+        self,
+        source_id=None,
+        eligibility_report=None,
+    ):
+        if source_id is not None and (
+            not isinstance(source_id, str) or not source_id.strip()
+        ):
+            raise ValueError("source_id must be a non-empty string.")
+        if eligibility_report is None:
+            eligibility_report = self.recover_relationships(
+                dry_run=True,
+                source_id=source_id,
+            )
+
+        with self.graph._lock:
+            active_snapshot = copy.deepcopy(
+                self.graph.graph.get(self.user_id)
+            )
+            graph_path = os.path.realpath(
+                os.path.abspath(self.graph.path_file)
+            )
+
+        active_user_graph = (
+            active_snapshot
+            if isinstance(active_snapshot, dict)
+            else {}
+        )
+        nodes = active_user_graph.get("nodes", [])
+        relationships = active_user_graph.get("relationships", [])
+        recovery_queue = active_user_graph.get(
+            self.graph.RELATIONSHIP_RECOVERY_KEY,
+            {},
+        )
+        nodes = nodes if isinstance(nodes, list) else []
+        relationships = relationships if isinstance(relationships, list) else []
+        recovery_queue = (
+            recovery_queue if isinstance(recovery_queue, dict) else {}
+        )
+
+        valid_records = [
+            record
+            for key, record in recovery_queue.items()
+            if (
+                self.graph._valid_recovery_record(record)
+                and key == record.get("source_id")
+            )
+        ]
+        invalid_record = any(
+            key == source_id
+            and (
+                not self.graph._valid_recovery_record(record)
+                or key != record.get("source_id")
+            )
+            for key, record in recovery_queue.items()
+        )
+        record = next(
+            (
+                item for item in valid_records
+                if item["source_id"] == source_id
+            ),
+            None,
+        ) if source_id is not None else None
+        node_exists = any(
+            isinstance(node, dict) and node.get("id") == source_id
+            for node in nodes
+        ) if source_id is not None else None
+        reason = (
+            self._relationship_eligibility_reason(
+                source_id,
+                eligibility_report,
+                record,
+                invalid_record,
+                node_exists,
+            )
+            if source_id is not None
+            else "not_requested"
+        )
+
+        disk_fingerprint = None
+        disk_error = None
+        disk_counts = {
+            "nodes": None,
+            "relationships": None,
+            "recovery_records": None,
+            "valid_recovery_records": None,
+        }
+        try:
+            with open(graph_path, "r", encoding="utf-8") as graph_file:
+                persisted_graph = json.load(graph_file)
+            if not isinstance(persisted_graph, dict):
+                disk_error = "invalid_graph_root"
+            else:
+                persisted_user_graph = persisted_graph.get(self.user_id)
+                if persisted_user_graph is None:
+                    persisted_user_graph = {}
+                if not isinstance(persisted_user_graph, dict):
+                    disk_error = "invalid_user_graph"
+                else:
+                    disk_fingerprint = self._diagnostic_fingerprint(
+                        persisted_user_graph
+                    )
+                    disk_nodes = persisted_user_graph.get("nodes", [])
+                    disk_relationships = persisted_user_graph.get(
+                        "relationships",
+                        [],
+                    )
+                    disk_recovery = persisted_user_graph.get(
+                        self.graph.RELATIONSHIP_RECOVERY_KEY,
+                        {},
+                    )
+                    if (
+                        not isinstance(disk_nodes, list)
+                        or not isinstance(disk_relationships, list)
+                        or not isinstance(disk_recovery, dict)
+                    ):
+                        disk_error = "invalid_graph_structure"
+                    disk_nodes = (
+                        disk_nodes if isinstance(disk_nodes, list) else []
+                    )
+                    disk_relationships = (
+                        disk_relationships
+                        if isinstance(disk_relationships, list)
+                        else []
+                    )
+                    disk_recovery = (
+                        disk_recovery
+                        if isinstance(disk_recovery, dict)
+                        else {}
+                    )
+                    disk_counts = {
+                        "nodes": len(disk_nodes),
+                        "relationships": len(disk_relationships),
+                        "recovery_records": len(disk_recovery),
+                        "valid_recovery_records": sum(
+                            1
+                            for key, item in disk_recovery.items()
+                            if (
+                                self.graph._valid_recovery_record(item)
+                                and key == item.get("source_id")
+                            )
+                        ),
+                    }
+        except FileNotFoundError:
+            disk_error = "file_not_found"
+        except PermissionError:
+            disk_error = "permission_denied"
+        except json.JSONDecodeError:
+            disk_error = "invalid_json"
+        except UnicodeDecodeError:
+            disk_error = "invalid_encoding"
+        except OSError:
+            disk_error = "read_error"
+
+        return {
+            "process_id": os.getpid(),
+            "graph_path": graph_path,
+            "memory_fingerprint": self._diagnostic_fingerprint(
+                active_snapshot
+            ),
+            "disk_fingerprint": disk_fingerprint,
+            "disk_error": disk_error,
+            "node_count": len(nodes),
+            "relationship_count": len(relationships),
+            "recovery_record_count": len(recovery_queue),
+            "valid_recovery_record_count": len(valid_records),
+            "disk_node_count": disk_counts["nodes"],
+            "disk_relationship_count": disk_counts["relationships"],
+            "disk_recovery_record_count": disk_counts["recovery_records"],
+            "disk_valid_recovery_record_count": (
+                disk_counts["valid_recovery_records"]
+            ),
+            "source_node_exists": node_exists,
+            "source_record_exists": record is not None,
+            "source_record_valid": record is not None,
+            "source_record_status": record["status"] if record else None,
+            "source_record_attempts": record["attempts"] if record else None,
+            "source_eligible": (
+                source_id in eligibility_report.get("eligible", [])
+                if source_id is not None
+                else None
+            ),
+            "source_eligibility_reason": reason,
+            "invalid_source_record": invalid_record,
+        }
+
+    def verify_remote_memory(self, memory_id):
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise ValueError("memory_id must be a non-empty string.")
+
+        try:
+            listing = self.memory.get_all_complete(self.user_id)
+        except Exception:
+            return {
+                "found": None,
+                "listing_complete": False,
+                "listing_valid": False,
+                "memory_count": None,
+                "result_count": None,
+                "result": "inconclusive",
+            }
+
+        if (
+            not isinstance(listing, dict)
+            or type(listing.get("count")) is not int
+            or listing["count"] < 0
+            or not isinstance(listing.get("results"), list)
+            or listing["count"] != len(listing["results"])
+        ):
+            return {
+                "found": None,
+                "listing_complete": False,
+                "listing_valid": False,
+                "memory_count": (
+                    listing.get("count")
+                    if isinstance(listing, dict)
+                    and type(listing.get("count")) is int
+                    and listing["count"] >= 0
+                    else None
+                ),
+                "result_count": (
+                    len(listing["results"])
+                    if isinstance(listing, dict)
+                    and isinstance(listing.get("results"), list)
+                    else None
+                ),
+                "result": "inconclusive",
+            }
+
+        memories = listing["results"]
+        memory_ids = []
+        for memory in memories:
+            if (
+                not isinstance(memory, dict)
+                or not isinstance(memory.get("id"), str)
+                or not memory["id"].strip()
+                or not isinstance(memory.get("memory"), str)
+                or not memory["memory"].strip()
+            ):
+                return {
+                    "found": None,
+                    "listing_complete": False,
+                    "listing_valid": False,
+                    "memory_count": listing["count"],
+                    "result_count": len(memories),
+                    "result": "inconclusive",
+                }
+            memory_ids.append(memory["id"])
+
+        if len(memory_ids) != len(set(memory_ids)):
+            return {
+                "found": None,
+                "listing_complete": False,
+                "listing_valid": False,
+                "memory_count": listing["count"],
+                "result_count": len(memories),
+                "result": "inconclusive",
+            }
+
+        found = memory_id in set(memory_ids)
+        return {
+            "found": found,
+            "listing_complete": True,
+            "listing_valid": True,
+            "memory_count": listing["count"],
+            "result_count": len(memories),
+            "result": "found" if found else "absent",
+        }
+
+    def restore_local_recovery_source(self, replacement_id):
+        if not isinstance(replacement_id, str) or not replacement_id.strip():
+            return {"status": "invalid_input"}
+
+        try:
+            listing = self.memory.get_all_complete(self.user_id)
+        except Exception:
+            return {"status": "listing_inconclusive"}
+
+        if (
+            not isinstance(listing, dict)
+            or type(listing.get("count")) is not int
+            or listing["count"] < 0
+            or not isinstance(listing.get("results"), list)
+            or listing["count"] != len(listing["results"])
+        ):
+            return {"status": "listing_inconclusive"}
+
+        memories = listing["results"]
+        memory_ids = []
+        requested_matches = []
+        for memory in memories:
+            if (
+                not isinstance(memory, dict)
+                or not isinstance(memory.get("id"), str)
+                or not memory["id"].strip()
+                or not isinstance(memory.get("memory"), str)
+                or not memory["memory"].strip()
+            ):
+                return {"status": "listing_inconclusive"}
+            memory_ids.append(memory["id"])
+            if memory["id"] == replacement_id and memory["memory"].strip():
+                requested_matches.append(memory)
+
+        if len(memory_ids) != len(set(memory_ids)):
+            return {"status": "listing_inconclusive"}
+        if not requested_matches:
+            return {
+                "status": "remote_source_not_found",
+                "listing_count": listing["count"],
+            }
+        if len(requested_matches) != 1:
+            return {
+                "status": "remote_source_ambiguous",
+                "listing_count": listing["count"],
+            }
+
+        result = self.graph.restore_local_recovery_source(
+            self.user_id,
+            replacement_id,
+            requested_matches[0]["memory"],
+        )
+        result["listing_count"] = listing["count"]
+        return result
 
     def deduplicate_memory(self, memory_text, importance, reason, confidence):
         """

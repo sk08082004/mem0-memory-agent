@@ -80,6 +80,59 @@ def remove_user():
         pass
 
 
+def print_recovery_runtime_diagnostics(
+    agent,
+    source_id=None,
+    eligibility_report=None,
+):
+    diagnostics = agent.relationship_runtime_diagnostics(
+        source_id,
+        eligibility_report,
+    )
+    disk_fingerprint = (
+        diagnostics["disk_fingerprint"]
+        if diagnostics["disk_fingerprint"] is not None
+        else f"unavailable ({diagnostics['disk_error'] or 'invalid_snapshot'})"
+    )
+    print(
+        "[RECOVERY-STATE] "
+        f"pid={diagnostics['process_id']} "
+        f"graph={diagnostics['graph_path']}"
+    )
+    print(
+        "[RECOVERY-STATE] "
+        f"in_memory_sha256={diagnostics['memory_fingerprint'] or 'unavailable'} "
+        f"on_disk_sha256={disk_fingerprint}"
+    )
+    print(
+        "[RECOVERY-STATE] "
+        f"memory_counts(nodes={diagnostics['node_count']}, "
+        f"relationships={diagnostics['relationship_count']}, "
+        f"records={diagnostics['recovery_record_count']}, "
+        f"valid_records={diagnostics['valid_recovery_record_count']}) "
+        f"disk_counts(nodes={diagnostics['disk_node_count']}, "
+        f"relationships={diagnostics['disk_relationship_count']}, "
+        f"records={diagnostics['disk_recovery_record_count']}, "
+        f"valid_records={diagnostics['disk_valid_recovery_record_count']})"
+    )
+    if diagnostics["disk_error"]:
+        print(
+            f"[RECOVERY-STATE] on_disk_error={diagnostics['disk_error']}"
+        )
+    if source_id is not None:
+        print(
+            "[RECOVERY-STATE] "
+            f"source={source_id} "
+            f"node_exists={diagnostics['source_node_exists']} "
+            f"valid_record={diagnostics['source_record_valid']} "
+            f"status={diagnostics['source_record_status'] or 'unavailable'} "
+            f"attempts={diagnostics['source_record_attempts'] if diagnostics['source_record_attempts'] is not None else 'unavailable'} "
+            f"eligible={diagnostics['source_eligible']} "
+            f"reason={diagnostics['source_eligibility_reason']}"
+        )
+    return diagnostics
+
+
 def get_active_memories(agent):
     """Return only current memories, hiding historical timeline versions."""
     memories = agent.memory.get_all(agent.user_id)
@@ -206,13 +259,34 @@ def main():
             ):
                 recovery_mode = "apply_source"
                 source_id = recovery_parts[2]
+            elif (
+                len(recovery_parts) == 3
+                and recovery_parts[1].lower() == "--inspect-source"
+            ):
+                recovery_mode = "inspect_source"
+                source_id = recovery_parts[2]
+            elif (
+                len(recovery_parts) == 3
+                and recovery_parts[1].lower() == "--verify-remote-source"
+            ):
+                recovery_mode = "verify_remote_source"
+                source_id = recovery_parts[2]
+            elif (
+                len(recovery_parts) == 3
+                and recovery_parts[1].lower() == "--restore-local-source"
+            ):
+                recovery_mode = "restore_local_source"
+                source_id = recovery_parts[2]
 
             try:
                 if recovery_mode == "invalid":
                     print(
                         "\nUsage: /recover-relationships "
                         "[--apply | --enroll <memory_id> | "
-                        "--apply-source <memory_id>]\n"
+                        "--apply-source <memory_id> | "
+                        "--inspect-source <memory_id> | "
+                        "--verify-remote-source <memory_id> | "
+                        "--restore-local-source <memory_id>]\n"
                     )
                     finish_timer(
                         "Command /recover-relationships",
@@ -251,16 +325,120 @@ def main():
                     )
                     continue
 
+                if recovery_mode == "inspect_source":
+                    report = agent.inspect_relationship_recovery(source_id)
+                    print(f"\nRelationship recovery inspection for {source_id}:")
+                    print(f"Source node exists: {report['node_exists']}")
+                    print(f"Valid recovery record exists: {report['record_valid']}")
+                    if report["invalid_record"]:
+                        print("Recovery record is invalid.")
+                    elif report["status"] is not None:
+                        print(f"Status: {report['status']}")
+                        print(f"Attempts: {report['attempts']}")
+                    print(f"Attempt cap: {report['attempt_cap']}")
+                    print(
+                        "Attempt cap reached: "
+                        f"{report['attempt_cap_reached']}"
+                    )
+                    print(f"Eligible for recovery: {report['eligible']}")
+                    print(f"Inspection result: {report['reason']}")
+                    print(f"Active graph node count: {report['node_count']}")
+                    print(
+                        "Recovery record count: "
+                        f"{report['recovery_record_count']}"
+                    )
+                    print(
+                        "Valid recovery record count: "
+                        f"{report['valid_recovery_record_count']}"
+                    )
+                    print(f"Recovery queue valid: {report['queue_valid']}")
+                    print("Read-only inspection; no changes were made.\n")
+                    print_recovery_runtime_diagnostics(agent, source_id)
+                    finish_timer(
+                        "Command /recover-relationships",
+                        command_start,
+                        command_succeeded,
+                    )
+                    continue
+
+                if recovery_mode == "verify_remote_source":
+                    report = agent.verify_remote_memory(source_id)
+                    print(
+                        "\nRemote Mem0 source verification "
+                        f"for {source_id}:"
+                    )
+                    print(f"Listing complete: {report['listing_complete']}")
+                    print(f"Listing validated: {report['listing_valid']}")
+                    print(
+                        "Exact memory ID found: "
+                        + (
+                            str(report["found"])
+                            if report["found"] is not None
+                            else "inconclusive"
+                        )
+                    )
+                    print(f"Result: {report['result']}")
+                    print(f"Reported memory count: {report['memory_count']}")
+                    print(f"Retrieved result count: {report['result_count']}")
+                    print("Local graph and recovery state were not changed.\n")
+                    finish_timer(
+                        "Command /recover-relationships",
+                        command_start,
+                        command_succeeded,
+                    )
+                    continue
+
+                if recovery_mode == "restore_local_source":
+                    report = agent.restore_local_recovery_source(
+                        source_id
+                    )
+                    print(
+                        "\nLocal graph source restoration "
+                        f"for {source_id}: {report['status']}"
+                    )
+                    if "node_exists" in report:
+                        print(f"Node already exists: {report['node_exists']}")
+                        print(
+                            "Recovery record already exists: "
+                            f"{report['recovery_record_exists']}"
+                        )
+                    if "listing_count" in report:
+                        print(
+                            "Validated remote listing count: "
+                            f"{report['listing_count']}"
+                        )
+                    if report["status"] == "restored":
+                        print(
+                            "The local node and pending recovery record "
+                            "were saved atomically."
+                        )
+                    print(
+                        "No Mem0 mutation or Gemini generation was performed.\n"
+                    )
+                    print_recovery_runtime_diagnostics(agent, source_id)
+                    finish_timer(
+                        "Command /recover-relationships",
+                        command_start,
+                        command_succeeded,
+                    )
+                    continue
+
                 apply_recovery = recovery_mode in {"apply", "apply_source"}
                 if recovery_mode == "apply_source":
                     report = agent.recover_relationships(
                         dry_run=False,
                         source_id=source_id,
                     )
+                    print_recovery_runtime_diagnostics(agent, source_id)
                 else:
                     report = agent.recover_relationships(
                         dry_run=not apply_recovery
                     )
+                    if recovery_mode == "preview":
+                        print_recovery_runtime_diagnostics(
+                            agent,
+                            eligibility_report=report,
+                        )
                 if recovery_mode == "apply_source":
                     print(
                         f"\nRelationship recovery for source {source_id}:"
@@ -854,6 +1032,9 @@ Available commands:
 /recover-relationships Preview relationship recovery; append --apply to apply.
 /recover-relationships --enroll <memory_id>  Track one graph node for recovery.
 /recover-relationships --apply-source <memory_id> Apply recovery for one source.
+/recover-relationships --inspect-source <memory_id> Inspect one source without changes.
+/recover-relationships --verify-remote-source <memory_id> Verify a source in Mem0.
+/recover-relationships --restore-local-source <memory_id> Restore a verified local source.
 /forget <num>          Delete a specific memory.
 /clear                 Delete all memories.
 /new                   Start a new conversation.
