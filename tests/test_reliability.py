@@ -2258,6 +2258,21 @@ class CliAndSessionTests(unittest.TestCase):
         self.session_patch.start()
         self.addCleanup(self.session_patch.stop)
 
+    def make_recovery_cli_agent(self, source_id, models):
+        graph_path = os.path.join(self.temp_dir.name, "cli-graph.json")
+        graph = KnowledgeGraph(graph_path)
+        graph.add_node("user-a", source_id, "Source memory")
+        graph.add_node("user-a", "target", "Target memory")
+        self.assertTrue(
+            graph.create_relationship_recovery("user-a", source_id)
+        )
+        agent = Agent.__new__(Agent)
+        agent.user_id = "user-a"
+        agent.graph = graph
+        agent.memory = types.SimpleNamespace()
+        agent.client = types.SimpleNamespace(models=models)
+        return agent
+
     def test_load_user_handles_invalid_files_and_values(self):
         self.assertIsNone(load_user())
         invalid = (
@@ -2436,6 +2451,146 @@ class CliAndSessionTests(unittest.TestCase):
         )
         self.assertIn("No generation was run.", output.getvalue())
         self.assertIn("Relationship recovery for source source:", output.getvalue())
+
+    def test_cli_preview_then_source_apply_uses_same_agent_graph_and_queue(self):
+        source_id = "588c27c5-4f7a-488d-ae9b-64e8067d2eff"
+        models = FakeModels(['{"relationships": []}'])
+        agent = self.make_recovery_cli_agent(source_id, models)
+        created_users = []
+        observations = []
+        original_recover = agent.recover_relationships
+        tracked_source_id = source_id
+
+        def create_fake_backed_agent(user_id):
+            created_users.append(user_id)
+            return agent
+
+        def observe_recovery(dry_run=True, batch_limit=5, attempt_limit=3, source_id=None):
+            recovery = agent.graph.get_relationship_recovery(agent.user_id)
+            record = next(
+                (
+                    item for item in recovery["records"]
+                    if item["source_id"] == tracked_source_id
+                ),
+                None,
+            )
+            observations.append(
+                {
+                    "user_id": agent.user_id,
+                    "graph": agent.graph,
+                    "queue": copy.deepcopy(
+                        agent.graph.get_user_graph(agent.user_id)[
+                            "relationship_recovery"
+                        ]
+                    ),
+                    "queue_record": copy.deepcopy(record),
+                    "source_id": source_id,
+                    "dry_run": dry_run,
+                }
+            )
+            return original_recover(
+                dry_run=dry_run,
+                batch_limit=batch_limit,
+                attempt_limit=attempt_limit,
+                source_id=source_id,
+            )
+
+        agent.recover_relationships = observe_recovery
+        with patch.object(
+            main_module,
+            "create_agent",
+            side_effect=create_fake_backed_agent,
+        ), patch.object(
+            main_module,
+            "load_user",
+            return_value="user-a",
+        ):
+            commands = iter(
+                [
+                    "/recover-relationships",
+                    f"/recover-relationships --apply-source {source_id}",
+                    "exit",
+                ]
+            )
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(created_users, ["user-a"])
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(observations[0]["user_id"], observations[1]["user_id"])
+        self.assertIs(observations[0]["graph"], observations[1]["graph"])
+        self.assertIs(observations[0]["graph"], agent.graph)
+        self.assertEqual(observations[0]["queue"], observations[1]["queue"])
+        self.assertEqual(observations[0]["queue_record"], observations[1]["queue_record"])
+        self.assertEqual(observations[0]["queue_record"]["status"], "pending_generation")
+        self.assertIn(source_id, output.getvalue())
+        self.assertIn("Eligible source IDs: ['" + source_id + "']", output.getvalue())
+        self.assertIn("Attempted: 1", output.getvalue())
+        self.assertNotIn("recovery_record_not_found", output.getvalue())
+        self.assertEqual(models.calls, 1)
+        self.assertEqual(
+            agent.graph.get_relationship_recovery("user-a")["records"][0]["status"],
+            "succeeded_empty",
+        )
+
+    def test_cli_reports_queue_removed_after_preview_without_model_call(self):
+        source_id = "588c27c5-4f7a-488d-ae9b-64e8067d2eff"
+        models = FakeModels([])
+        agent = self.make_recovery_cli_agent(source_id, models)
+        observations = []
+        original_recover = agent.recover_relationships
+
+        def observe_recovery(dry_run=True, batch_limit=5, attempt_limit=3, source_id=None):
+            observations.append(agent.graph)
+            return original_recover(
+                dry_run=dry_run,
+                batch_limit=batch_limit,
+                attempt_limit=attempt_limit,
+                source_id=source_id,
+            )
+
+        agent.recover_relationships = observe_recovery
+        input_calls = 0
+
+        def next_command(prompt=""):
+            nonlocal input_calls
+            input_calls += 1
+            if input_calls == 1:
+                return "/recover-relationships"
+            if input_calls == 2:
+                agent.graph.get_user_graph("user-a")[
+                    "relationship_recovery"
+                ].pop(source_id)
+                agent.graph.save()
+                return f"/recover-relationships --apply-source {source_id}"
+            return "exit"
+
+        with patch.object(
+            main_module,
+            "create_agent",
+            return_value=agent,
+        ), patch.object(
+            main_module,
+            "load_user",
+            return_value="user-a",
+        ):
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=next_command,
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(len(observations), 2)
+        self.assertIs(observations[0], observations[1])
+        self.assertIn("Eligible source IDs: ['" + source_id + "']", output.getvalue())
+        self.assertIn(f"- {source_id}: recovery_record_not_found", output.getvalue())
+        self.assertIn("Attempted: 0", output.getvalue())
+        self.assertEqual(models.calls, 0)
 
     def test_save_rejects_blank_ids_and_persistence_failure_preserves_file(self):
         for value in ("", "  ", None, 2):
