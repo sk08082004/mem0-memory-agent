@@ -1,5 +1,6 @@
 from app.agent import Agent
 from app.config import SESSION_FILE
+from app.performance import finish_timer, start_timer
 import json
 import os
 import tempfile
@@ -152,6 +153,8 @@ def main():
 
         # Show memories command
         if user_input.lower() == "/memories":
+            command_start = start_timer()
+            command_succeeded = True
             try:
                 active_memories = get_active_memories(agent)
 
@@ -169,21 +172,99 @@ def main():
                 print()
 
             except Exception as e:
+                command_succeeded = False
                 print(
                     f"\n[ERROR] Could not retrieve memories: {e}\n"
                 )
 
+            finish_timer(
+                "Command /memories",
+                command_start,
+                command_succeeded,
+            )
             continue
 
-        if user_input.lower() in {
-            "/recover-relationships",
-            "/recover-relationships --apply",
-        }:
-            apply_recovery = user_input.lower().endswith("--apply")
+        recovery_parts = user_input.split()
+        if recovery_parts and recovery_parts[0].lower() == "/recover-relationships":
+            command_start = start_timer()
+            command_succeeded = True
+            recovery_mode = "invalid"
+            source_id = None
+            if len(recovery_parts) == 1:
+                recovery_mode = "preview"
+            elif len(recovery_parts) == 2 and recovery_parts[1].lower() == "--apply":
+                recovery_mode = "apply"
+            elif (
+                len(recovery_parts) == 3
+                and recovery_parts[1].lower() == "--enroll"
+            ):
+                recovery_mode = "enroll"
+                source_id = recovery_parts[2]
+            elif (
+                len(recovery_parts) == 3
+                and recovery_parts[1].lower() == "--apply-source"
+            ):
+                recovery_mode = "apply_source"
+                source_id = recovery_parts[2]
+
             try:
-                report = agent.recover_relationships(
-                    dry_run=not apply_recovery
-                )
+                if recovery_mode == "invalid":
+                    print(
+                        "\nUsage: /recover-relationships "
+                        "[--apply | --enroll <memory_id> | "
+                        "--apply-source <memory_id>]\n"
+                    )
+                    finish_timer(
+                        "Command /recover-relationships",
+                        command_start,
+                        command_succeeded,
+                    )
+                    continue
+
+                if recovery_mode == "enroll":
+                    result = agent.enroll_relationship_recovery(source_id)
+                    if result["status"] == "enrolled":
+                        print(
+                            "\nRelationship recovery source enrolled. "
+                            "No generation was run.\n"
+                        )
+                    elif result["status"] == "already_tracked":
+                        print(
+                            "\nSource already has a recovery record "
+                            f"({result['record_status']}); it was not changed.\n"
+                        )
+                    else:
+                        print(
+                            "\nCould not enroll recovery source: "
+                            f"{result['status']}"
+                            + (
+                                f" ({result['reason']})"
+                                if result.get("reason")
+                                else ""
+                            )
+                            + "\n"
+                        )
+                    finish_timer(
+                        "Command /recover-relationships",
+                        command_start,
+                        command_succeeded,
+                    )
+                    continue
+
+                apply_recovery = recovery_mode in {"apply", "apply_source"}
+                if recovery_mode == "apply_source":
+                    report = agent.recover_relationships(
+                        dry_run=False,
+                        source_id=source_id,
+                    )
+                else:
+                    report = agent.recover_relationships(
+                        dry_run=not apply_recovery
+                    )
+                if recovery_mode == "apply_source":
+                    print(
+                        f"\nRelationship recovery for source {source_id}:"
+                    )
                 if not apply_recovery:
                     print("\nRelationship recovery preview (dry run):")
                     print(f"Eligible source IDs: {report['eligible']}")
@@ -283,11 +364,19 @@ def main():
                         )
                     print()
             except Exception as e:
+                command_succeeded = False
                 print(f"\n[ERROR] Relationship recovery failed: {e}\n")
+            finish_timer(
+                "Command /recover-relationships",
+                command_start,
+                command_succeeded,
+            )
             continue
 
         # show knowledge graph
         if user_input.lower() == "/graph":
+            command_start = start_timer()
+            command_succeeded = True
             try:
                 memories = agent.memory.get_all_complete(agent.user_id)
 
@@ -309,6 +398,11 @@ def main():
 
                 if not nodes:
                     print("No nodes in the graph.")
+                    finish_timer(
+                        "Command /graph",
+                        command_start,
+                        command_succeeded,
+                    )
                     continue
 
                 node_number = {}
@@ -345,25 +439,43 @@ def main():
                 print()
 
             except Exception as e:
+                command_succeeded = False
                 print(
                     f"\n[ERROR] Could not retrieve knowledge graph: {e}\n"
                 )
 
+            finish_timer(
+                "Command /graph",
+                command_start,
+                command_succeeded,
+            )
             continue
 
 
         # show memories related to a specific memory
         if user_input.lower().startswith("/related"):
+            command_start = start_timer()
+            command_succeeded = True
             parts = user_input.split()
 
             if len(parts) != 2:
                 print("\nUsage: /related <memory_number>\n")
+                finish_timer(
+                    "Command /related",
+                    command_start,
+                    command_succeeded,
+                )
                 continue
 
             try:
                 memory_number = int(parts[1])
             except ValueError:
                 print("\nPlease enter a valid memory number.\n")
+                finish_timer(
+                    "Command /related",
+                    command_start,
+                    command_succeeded,
+                )
                 continue
 
             try:
@@ -385,6 +497,11 @@ def main():
 
                 if memory_number < 1 or memory_number > len(nodes):
                     print("\nInvalid memory number.\n")
+                    finish_timer(
+                        "Command /related",
+                        command_start,
+                        command_succeeded,
+                    )
                     continue
 
                 selected_node = nodes[memory_number - 1]
@@ -437,10 +554,16 @@ def main():
                 print()
 
             except Exception as e:
+                command_succeeded = False
                 print(
                     f"\n[ERROR] Could not retrieve related memories: {e}\n"
                 )
 
+            finish_timer(
+                "Command /related",
+                command_start,
+                command_succeeded,
+            )
             continue
 
 
@@ -729,6 +852,8 @@ Available commands:
 /memory-info <num>     Show detailed memory provenance.
 /graph                 View the knowledge graph. 
 /recover-relationships Preview relationship recovery; append --apply to apply.
+/recover-relationships --enroll <memory_id>  Track one graph node for recovery.
+/recover-relationships --apply-source <memory_id> Apply recovery for one source.
 /forget <num>          Delete a specific memory.
 /clear                 Delete all memories.
 /new                   Start a new conversation.
@@ -752,7 +877,6 @@ exit                   Exit the agent
 
         # Normal conversation
         response = agent.respond(user_input)
-
         print(f"\nAgent: {response}\n")
 
 

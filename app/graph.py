@@ -4,6 +4,8 @@ import os
 import tempfile
 import threading
 
+from app.performance import timed_operation
+
 
 class KnowledgeGraph:
     RELATIONSHIP_RECOVERY_KEY = "relationship_recovery"
@@ -41,6 +43,10 @@ class KnowledgeGraph:
             return {}
 
     def save(self, graph=None):
+        with timed_operation("Graph persistence"):
+            return self._save(graph)
+
+    def _save(self, graph=None):
         with self._lock:
             graph_to_save = self.graph if graph is None else graph
             directory = os.path.dirname(os.path.abspath(self.path_file))
@@ -669,6 +675,14 @@ class KnowledgeGraph:
             }
 
     def sync_user_graph(
+        self,
+        user_id,
+        memories
+    ):
+        with timed_operation("Graph synchronization"):
+            return self._sync_user_graph(user_id, memories)
+
+    def _sync_user_graph(
         self,
         user_id,
         memories

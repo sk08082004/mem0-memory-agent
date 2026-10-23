@@ -7,6 +7,8 @@ import traceback
 
 import time
 
+from app.performance import timed_operation
+
 logging.getLogger("google").setLevel(logging.ERROR)
 
 from google import genai
@@ -197,50 +199,126 @@ class Agent:
         return merged_metadata
 
     def get_memory_id(self, event_id, attempts=30, delay=1):
+        metrics = {}
+        with timed_operation("Mem0 event polling total") as outcome:
+            memory_id = self._get_memory_id(
+                event_id,
+                attempts,
+                delay,
+                metrics,
+            )
+            outcome["succeeded"] = memory_id is not None
+            outcome["details"] = (
+                f"attempts={metrics.get('attempts', 0)}, "
+                f"request_ms={metrics.get('request_ms', 0.0):.2f}, "
+                f"sleep_ms={metrics.get('sleep_ms', 0.0):.2f}, "
+                f"outcome={metrics.get('outcome', 'unknown')}"
+            )
+            return memory_id
+
+    def _get_memory_id(self, event_id, attempts, delay, metrics=None):
         """
         Wait for a Mem0 add event to finish
         and return the actual memory ID.
         """
 
-        for _ in range(attempts):
+        metrics = metrics if metrics is not None else {}
+        metrics.update({
+            "attempts": 0,
+            "request_ms": 0.0,
+            "sleep_ms": 0.0,
+            "outcome": "timeout",
+        })
+        pending_statuses = {
+            "PENDING",
+            "RUNNING",
+            "PROCESSING",
+            "IN_PROGRESS",
+        }
+
+        def sleep_for_retry():
+            sleep_start = time.perf_counter()
+            time.sleep(delay)
+            elapsed_ms = (time.perf_counter() - sleep_start) * 1000
+            metrics["sleep_ms"] += elapsed_ms
+            return elapsed_ms
+
+        for attempt in range(1, attempts + 1):
+            metrics["attempts"] = attempt
+            request_start = time.perf_counter()
+            request_ms = 0.0
+            sleep_ms = 0.0
+            request_status = "exception"
+            result_category = "exception"
             try:
-                response = self.memory.get_event(event_id)
+                try:
+                    response = self.memory.get_event(event_id)
+                    request_status = (
+                        "success"
+                        if response.status_code == 200
+                        else "error"
+                    )
+                finally:
+                    request_ms = (
+                        time.perf_counter() - request_start
+                    ) * 1000
+                    metrics["request_ms"] += request_ms
 
                 if response.status_code != 200:
-                    time.sleep(delay)
-                    continue
+                    result_category = "http_error"
+                    sleep_ms = sleep_for_retry()
+                else:
+                    event = response.json()
+                    status = event.get("status")
 
-                event = response.json()
-                status = event.get("status")
+                    if status == "SUCCEEDED":
+                        results = event.get("results", [])
+                        memory_id = None
 
-                if status == "SUCCEEDED":
-                    results = event.get("results", [])
+                        if isinstance(results, list):
+                            for item in results:
+                                if isinstance(item, dict):
+                                    memory_id = item.get("id")
+                                    if memory_id:
+                                        break
 
-                    if isinstance(results, list):
-                        for item in results:
-                            if isinstance(item, dict):
-                                memory_id = item.get("id")
+                        if memory_id:
+                            result_category = "succeeded_with_memory_id"
+                            metrics["outcome"] = "resolved"
+                            return memory_id
 
-                                if memory_id:
-                                    return memory_id
+                        result_category = "succeeded_without_memory_id"
+                        metrics["outcome"] = "succeeded_without_memory_id"
+                        return None
 
-                    return None
+                    if status == "FAILED":
+                        result_category = "failed"
+                        metrics["outcome"] = "failed"
+                        print("[GRAPH] Mem0 event failed.")
+                        return None
 
-                if status == "FAILED":
-                    print(
-                        f"[GRAPH] Mem0 event failed: "
-                        f"{event.get('error', 'Unknown error')}"
-                    )
-                    return None
+                    if isinstance(status, str) and status.upper() in pending_statuses:
+                        result_category = "pending"
+                    else:
+                        result_category = "unknown_status"
+                    sleep_ms = sleep_for_retry()
 
             except Exception as e:
+                result_category = "exception"
+                metrics["outcome"] = "exception"
+                print("[GRAPH] Could not retrieve Mem0 event.")
+                sleep_ms = sleep_for_retry()
+            finally:
                 print(
-                    f"[GRAPH] Could not retrieve Mem0 event: {e}"
+                    f"[TIME] Mem0 event poll attempt {attempt}: "
+                    f"http={request_status}, "
+                    f"result={result_category}, "
+                    f"request_ms={request_ms:.2f}, "
+                    f"sleep_ms={sleep_ms:.2f}"
                 )
 
-            time.sleep(delay)
-
         print("[GRAPH] Timed out waiting for Mem0 event.")
+        metrics["outcome"] = "timeout"
         return None
 
     def remember(self, message, response):
@@ -338,19 +416,20 @@ User message:
 """
 
         try:
-            extraction = self.client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
+            with timed_operation("Gemini memory extraction"):
+                extraction = self.client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
                         thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
+                            thinking_level="minimal"
+                        ),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        )
                     )
                 )
-            )
 
             response_text = extraction.text.strip()
 
@@ -586,24 +665,20 @@ User message:
     }}
     """
 
-        start_time = time.time()
-        response = self.client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                ),
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
+        with timed_operation("Gemini relationship generation"):
+            response = self.client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
                 )
             )
-        )
-        print(
-            f"[TIME] graph relationship Gemini: "
-            f"{time.time() - start_time:.2f}s"
-        )
 
         result = json.loads(response.text)
         if (
@@ -726,12 +801,18 @@ User message:
         self,
         dry_run=True,
         batch_limit=RELATIONSHIP_RECOVERY_BATCH_LIMIT,
-        attempt_limit=RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT
+        attempt_limit=RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT,
+        source_id=None,
     ):
         if type(batch_limit) is not int or batch_limit < 1:
             raise ValueError("batch_limit must be a positive integer.")
         if type(attempt_limit) is not int or attempt_limit < 1:
             raise ValueError("attempt_limit must be a positive integer.")
+        if source_id is not None and (
+            not isinstance(source_id, str) or not source_id.strip()
+        ):
+            raise ValueError("source_id must be a non-empty string.")
+        source_filter = source_id
         batch_limit = min(batch_limit, self.RELATIONSHIP_RECOVERY_BATCH_LIMIT)
         attempt_limit = min(
             attempt_limit,
@@ -759,6 +840,13 @@ User message:
             report["error"] = recovery["error"]
             report["blocked"] = recovery["blocked_count"]
             return report
+        if source_filter is not None:
+            report["invalid_records"] = [
+                invalid_id
+                for invalid_id in recovery["invalid_records"]
+                if invalid_id == source_filter
+            ]
+            report["blocked"] = len(report["invalid_records"])
 
         current_user_graph = self.graph.graph.get(self.user_id, {})
         graph_nodes = (
@@ -811,6 +899,8 @@ User message:
         for record in recovery["records"]:
             status = record["status"]
             source_id = record["source_id"]
+            if source_filter is not None and source_filter != source_id:
+                continue
             if status in {"succeeded", "succeeded_empty"}:
                 continue
             if status == "superseded":
@@ -895,10 +985,21 @@ User message:
             eligible.append(record)
 
         report["eligible"] = [record["source_id"] for record in eligible]
+        if source_filter is not None and not any(
+            record["source_id"] == source_filter
+            for record in recovery["records"]
+        ) and source_filter not in report["invalid_records"]:
+            report["details"].append(
+                {
+                    "source_id": source_filter,
+                    "status": "recovery_record_not_found",
+                }
+            )
         report["remaining"] = max(0, len(eligible) - batch_limit)
         if dry_run:
             report["pending"] = len(eligible)
-            report["blocked"] += len(report["invalid_records"])
+            if source_filter is None:
+                report["blocked"] += len(report["invalid_records"])
             return report
 
         for record in eligible[:batch_limit]:
@@ -1017,8 +1118,85 @@ User message:
                 )
 
         report["pending"] += report["remaining"]
-        report["blocked"] += recovery["blocked_count"]
+        if source_filter is None:
+            report["blocked"] += recovery["blocked_count"]
         return report
+
+    def enroll_relationship_recovery(self, source_id):
+        if not isinstance(source_id, str) or not source_id.strip():
+            return {"status": "invalid_source"}
+
+        recovery = self.graph.get_relationship_recovery(self.user_id)
+        if not recovery["valid"]:
+            return {
+                "status": "invalid_queue",
+                "reason": recovery["error"],
+            }
+        if recovery["invalid_records"]:
+            return {
+                "status": "invalid_queue",
+                "reason": "The recovery queue contains invalid records.",
+            }
+
+        user_graph = self.graph.graph.get(self.user_id)
+        if not isinstance(user_graph, dict):
+            return {"status": "missing_node"}
+        nodes = user_graph.get("nodes")
+        if not isinstance(nodes, list):
+            return {"status": "invalid_graph"}
+
+        source_node = next(
+            (
+                node for node in nodes
+                if isinstance(node, dict) and node.get("id") == source_id
+            ),
+            None,
+        )
+        if source_node is None:
+            return {"status": "missing_node"}
+        memory_text = source_node.get("memory_text")
+        if not isinstance(memory_text, str) or not memory_text.strip():
+            return {"status": "missing_text"}
+
+        existing_record = next(
+            (
+                record for record in recovery["records"]
+                if record["source_id"] == source_id
+            ),
+            None,
+        )
+        if existing_record is not None:
+            return {
+                "status": "already_tracked",
+                "record_status": existing_record["status"],
+            }
+
+        if recovery["queue_size"] >= self.graph.MAX_RECOVERY_RECORDS:
+            return {"status": "queue_full"}
+
+        if not self.graph.create_relationship_recovery(
+            self.user_id,
+            source_id,
+        ):
+            return {"status": "enrollment_failed"}
+
+        refreshed = self.graph.get_relationship_recovery(self.user_id)
+        record = next(
+            (
+                item for item in refreshed["records"]
+                if item["source_id"] == source_id
+            ),
+            None,
+        )
+        if record is None:
+            return {"status": "enrollment_failed"}
+        if record["status"] != "pending_generation" or record["attempts"] != 0:
+            return {
+                "status": "already_tracked",
+                "record_status": record["status"],
+            }
+
+        return {"status": "enrolled"}
 
     def deduplicate_memory(self, memory_text, importance, reason, confidence):
         """
@@ -1232,20 +1410,20 @@ Format when there is no duplicate:
 }}
 """
             
-            response = self.client.models.generate_content(
-
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
+            with timed_operation("Gemini memory deduplication"):
+                response = self.client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(
+                            thinking_level="minimal"
+                        ),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        )
                     )
                 )
-            )
 
             response_text = response.text.strip()
 
@@ -1559,19 +1737,20 @@ If there are no updates, return:
     "updates": []
 }}
 """
-            response = self.client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
+            with timed_operation("Gemini memory update analysis"):
+                response = self.client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(
+                            thinking_level="minimal"
+                        ),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        )
                     )
                 )
-            )
 
             response_text = response.text.strip()
 
@@ -1974,19 +2153,20 @@ User message:
 """
 
         try:
-            response = self.client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
+            with timed_operation("Gemini memory decision"):
+                response = self.client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(
+                            thinking_level="minimal"
+                        ),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        )
                     )
                 )
-            )
 
             response_text = response.text.strip()
 
@@ -2007,6 +2187,10 @@ User message:
             return False
 
     def respond(self, message):
+        with timed_operation("User-message handling"):
+            return self._respond(message)
+
+    def _respond(self, message):
         """
         Generate a response using short-term
         and long-term memory.
@@ -2217,18 +2401,19 @@ Do not invent information.
 Answer naturally.
 """
 
-        response = self.client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=system_prompt,
-            config=types.GenerateContentConfig(     
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                ),
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
+        with timed_operation("Gemini response generation"):
+            response = self.client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=system_prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
                 )
             )
-        )
 
 
         answer = response.text
@@ -2242,7 +2427,9 @@ Answer naturally.
         # Store normal long-term information only when the message did not
         # update an existing memory. Updated memories have already been
         # replaced by update_memory().
-        should_remember = self.decide_memory(message)
+        should_remember = (
+            False if was_updated else self.decide_memory(message)
+        )
 
         print(f"[DEBUG] Should remember: {should_remember}")
 

@@ -1,6 +1,7 @@
 import os
 
 from mem0 import MemoryClient
+from app.performance import timed_operation
 
 
 class MemoryManager:
@@ -21,34 +22,36 @@ class MemoryManager:
         Store important information from a conversation.
         """
 
-        result = self.client.add(
-            messages=messages,
-            user_id=user_id,
-            metadata=metadata
-        )
+        with timed_operation("Mem0 add"):
+            result = self.client.add(
+                messages=messages,
+                user_id=user_id,
+                metadata=metadata
+            )
 
         return result
 
     def get_event(self, event_id):
-       """
-       Get the status of a Mem0 background event.
-       """
+        """
+        Get the status of a Mem0 background event.
+        """
 
-       return self.client.client.get(
+        return self.client.client.get(
             f"/v1/event/{event_id}/"
-       )
+        )
 
     def search(self, query, user_id):
         """
         Search the user's long-term memories.
         """
 
-        results = self.client.search(
-            query=query,
-            filters={
-                "user_id": user_id
-            }
-        )
+        with timed_operation("Mem0 search/recall"):
+            results = self.client.search(
+                query=query,
+                filters={
+                    "user_id": user_id
+                }
+            )
 
         return results
 
@@ -57,11 +60,12 @@ class MemoryManager:
         Get all memories belonging to the user.
         """
 
-        results = self.client.get_all(
-            filters={
-                "user_id": user_id
-            }
-        )
+        with timed_operation("Mem0 list"):
+            results = self.client.get_all(
+                filters={
+                    "user_id": user_id
+                }
+            )
 
         return results
 
@@ -70,17 +74,22 @@ class MemoryManager:
         Retrieve every page of memories for one user.
         """
 
+        with timed_operation("Mem0 complete pagination"):
+            return self._get_all_complete(user_id)
+
+    def _get_all_complete(self, user_id):
         memories = []
         page = 1
         expected_count = None
 
         while True:
-            response = self.client.get_all(
-                filters={
-                    "user_id": user_id
-                },
-                page=page
-            )
+            with timed_operation(f"Mem0 list page {page}"):
+                response = self.client.get_all(
+                    filters={
+                        "user_id": user_id
+                    },
+                    page=page
+                )
 
             if (
                 not isinstance(response, dict)
@@ -158,7 +167,8 @@ class MemoryManager:
         Delete one memory.
         """
 
-        return self.client.delete(memory_id)
+        with timed_operation("Mem0 delete"):
+            return self.client.delete(memory_id)
 
     @staticmethod
     def delete_result_status(result):

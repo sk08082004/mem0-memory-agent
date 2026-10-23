@@ -7,7 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 def _install_service_import_stubs():
@@ -1404,6 +1404,356 @@ class RelationshipRecoveryTests(unittest.TestCase):
         self.assertEqual(failure["status"], "failed")
         self.assertIn("synthetic generation failure", failure["reason"])
 
+    def test_enrollment_persists_existing_node_without_model_or_mem0_calls(self):
+        self.graph.add_node("user-a", "source", "Source memory")
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        result = self.agent.enroll_relationship_recovery("source")
+
+        self.assertEqual(result, {"status": "enrolled"})
+        recovery = self.graph.get_relationship_recovery("user-a")
+        self.assertEqual(recovery["records"], [self.pending_record("source")])
+        self.assertEqual(models.calls, 0)
+        with open(self.path, encoding="utf-8") as graph_file:
+            persisted = json.load(graph_file)
+        self.assertEqual(
+            persisted["user-a"]["relationship_recovery"]["source"]["status"],
+            "pending_generation",
+        )
+
+    def test_enrollment_rejects_missing_node_text_and_other_users_node(self):
+        self.graph.add_node("user-a", "empty", "   ")
+        self.graph.add_node("user-b", "other-user-source", "Other user's text")
+
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("missing"),
+            {"status": "missing_node"},
+        )
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("empty"),
+            {"status": "missing_text"},
+        )
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("other-user-source"),
+            {"status": "missing_node"},
+        )
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"],
+            [],
+        )
+
+    def test_duplicate_and_terminal_enrollment_do_not_change_records(self):
+        self.graph.add_node("user-a", "source", "Source memory")
+        self.assertTrue(
+            self.graph.create_relationship_recovery("user-a", "source")
+        )
+        before = self.graph.get_relationship_recovery("user-a")["records"][0]
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("source"),
+            {
+                "status": "already_tracked",
+                "record_status": "pending_generation",
+            },
+        )
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"][0],
+            before,
+        )
+
+        self.graph.set_relationship_recovery_status(
+            "user-a",
+            "source",
+            "succeeded_empty",
+        )
+        terminal_before = self.graph.get_relationship_recovery(
+            "user-a"
+        )["records"][0]
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("source"),
+            {
+                "status": "already_tracked",
+                "record_status": "succeeded_empty",
+            },
+        )
+        self.assertEqual(
+            self.graph.get_relationship_recovery("user-a")["records"][0],
+            terminal_before,
+        )
+
+    def test_enrollment_refuses_invalid_oversized_and_full_queues(self):
+        self.graph.add_node("user-a", "source", "Source memory")
+        self.graph.graph["user-a"]["relationship_recovery"] = "malformed"
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("source")["status"],
+            "invalid_queue",
+        )
+
+        self.write_recovery_queue(201)
+        self.graph.add_node("user-a", "source", "Source memory")
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("source")["status"],
+            "invalid_queue",
+        )
+
+        self.write_recovery_queue(200)
+        self.graph.graph["user-a"]["nodes"].append(
+            {"id": "source", "memory_text": "Source memory"}
+        )
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("source"),
+            {"status": "queue_full"},
+        )
+
+    def test_enrollment_persistence_failure_preserves_graph_state(self):
+        self.graph.add_node("user-a", "source", "Source memory")
+        before_graph = copy.deepcopy(self.graph.graph)
+        with open(self.path, "rb") as graph_file:
+            before_file = graph_file.read()
+
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=OSError("synthetic persistence failure"),
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "synthetic persistence failure",
+            ):
+                self.agent.enroll_relationship_recovery("source")
+
+        self.assertEqual(self.graph.graph, before_graph)
+        with open(self.path, "rb") as graph_file:
+            self.assertEqual(graph_file.read(), before_file)
+
+    def test_source_filtered_apply_leaves_other_recovery_sources_untouched(self):
+        self.add_source_and_target("source", "target")
+        self.graph.add_node("user-a", "other-source", "Other source")
+        self.graph.create_relationship_recovery("user-a", "source")
+        self.graph.create_relationship_recovery("user-a", "other-source")
+        models = FakeModels([self.relationship_response()])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        report = self.agent.recover_relationships(
+            dry_run=False,
+            source_id="source",
+        )
+
+        records = {
+            record["source_id"]: record
+            for record in self.graph.get_relationship_recovery("user-a")["records"]
+        }
+        self.assertEqual(report["attempted"], 1)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertEqual(models.calls, 1)
+        self.assertEqual(records["source"]["status"], "succeeded")
+        self.assertEqual(records["other-source"]["status"], "pending_generation")
+        self.assertEqual(records["other-source"]["attempts"], 0)
+        self.assertEqual(
+            self.agent.recover_relationships(
+                dry_run=False,
+                source_id="untracked",
+            )["details"],
+            [{"source_id": "untracked", "status": "recovery_record_not_found"}],
+        )
+        self.assertEqual(models.calls, 1)
+
+    def test_preview_then_source_apply_attempts_same_eligible_record(self):
+        source_id = "588c27c5-4f7a-488d-ae9b-64e8067d2eff"
+        self.add_source_and_target(source_id, "target")
+        self.graph.add_node("user-a", "other-source", "Other source")
+        self.graph.create_relationship_recovery("user-a", source_id)
+        self.graph.create_relationship_recovery("user-a", "other-source")
+        models = FakeModels([self.relationship_response()])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        preview = self.agent.recover_relationships(dry_run=True)
+        apply_report = self.agent.recover_relationships(
+            dry_run=False,
+            source_id=source_id,
+        )
+
+        self.assertIn(source_id, preview["eligible"])
+        self.assertNotIn(
+            {
+                "source_id": source_id,
+                "status": "recovery_record_not_found",
+            },
+            apply_report["details"],
+        )
+        self.assertEqual(apply_report["attempted"], 1)
+        self.assertEqual(apply_report["succeeded"], 1)
+        self.assertEqual(models.calls, 1)
+        records = {
+            record["source_id"]: record
+            for record in self.graph.get_relationship_recovery("user-a")["records"]
+        }
+        self.assertEqual(records[source_id]["status"], "succeeded")
+        self.assertEqual(records["other-source"]["status"], "pending_generation")
+        self.assertEqual(records["other-source"]["attempts"], 0)
+
+    def test_source_apply_reports_record_removed_after_preview_without_model_call(self):
+        source_id = "588c27c5-4f7a-488d-ae9b-64e8067d2eff"
+        self.add_source_and_target(source_id, "target")
+        self.graph.create_relationship_recovery("user-a", source_id)
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        preview = self.agent.recover_relationships(dry_run=True)
+        self.assertIn(source_id, preview["eligible"])
+
+        self.graph.get_user_graph("user-a")[
+            "relationship_recovery"
+        ].pop(source_id)
+        self.graph.save()
+        apply_report = self.agent.recover_relationships(
+            dry_run=False,
+            source_id=source_id,
+        )
+
+        self.assertEqual(apply_report["attempted"], 0)
+        self.assertIn(
+            {
+                "source_id": source_id,
+                "status": "recovery_record_not_found",
+            },
+            apply_report["details"],
+        )
+        self.assertEqual(models.calls, 0)
+
+    def test_source_filtered_apply_respects_attempt_cap_and_missing_endpoint(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        for _ in range(self.agent.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT):
+            self.graph.begin_relationship_attempt(
+                "user-a",
+                "source",
+                self.agent.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT,
+            )
+        self.graph.set_relationship_recovery_status(
+            "user-a",
+            "source",
+            "failed",
+            "retryable failure",
+        )
+        models = FakeModels([])
+        self.agent.client = types.SimpleNamespace(models=models)
+
+        capped = self.agent.recover_relationships(
+            dry_run=False,
+            source_id="source",
+        )
+
+        self.assertEqual(capped["capped"], ["source"])
+        self.assertEqual(models.calls, 0)
+
+        self.graph.delete_node("user-a", "source")
+        missing = self.agent.recover_relationships(
+            dry_run=False,
+            source_id="source",
+        )
+        self.assertEqual(missing["blocked"], 1)
+        self.assertEqual(models.calls, 0)
+
+    def test_source_filtered_relationship_persistence_failure_stays_pending(self):
+        self.add_source_and_target()
+        self.graph.create_relationship_recovery("user-a", "source")
+        models = FakeModels([self.relationship_response()])
+        self.agent.client = types.SimpleNamespace(models=models)
+        original_save = self.graph.save
+        save_count = 0
+
+        def fail_expected_edge_persistence(graph=None):
+            nonlocal save_count
+            save_count += 1
+            if save_count == 2:
+                raise OSError("synthetic edge persistence failure")
+            return original_save(graph)
+
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=fail_expected_edge_persistence,
+        ):
+            report = self.agent.recover_relationships(
+                dry_run=False,
+                source_id="source",
+            )
+
+        record = self.graph.get_relationship_recovery("user-a")["records"][0]
+        self.assertEqual(report["pending"], 1)
+        self.assertEqual(record["status"], "pending_generation")
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["relationships"],
+            [],
+        )
+        self.assertEqual(models.calls, 1)
+
+    def test_replacement_enrollment_does_not_redirect_superseded_history(self):
+        self.add_source_and_target("old-source", "target")
+        self.graph.add_relationship(
+            "user-a",
+            "old-source",
+            "target",
+            "related_to",
+        )
+        self.graph.create_relationship_recovery("user-a", "old-source")
+        self.graph.reconcile_memory_replacement(
+            "user-a",
+            "old-source",
+            "replacement",
+            "Replacement memory",
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["relationships"],
+            [],
+        )
+        old_record = next(
+            record
+            for record in self.graph.get_relationship_recovery("user-a")["records"]
+            if record["source_id"] == "old-source"
+        )
+        old_record_before = copy.deepcopy(old_record)
+        self.graph.add_node("user-a", "replacement", "Replacement memory")
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([self.relationship_response()])
+        )
+
+        self.assertEqual(
+            self.agent.enroll_relationship_recovery("replacement"),
+            {"status": "enrolled"},
+        )
+        report = self.agent.recover_relationships(
+            dry_run=False,
+            source_id="replacement",
+        )
+
+        user_graph = self.graph.get_user_graph("user-a")
+        records = {
+            record["source_id"]: record
+            for record in self.graph.get_relationship_recovery("user-a")["records"]
+        }
+        self.assertEqual(report["succeeded"], 1)
+        self.assertEqual(records["old-source"], old_record_before)
+        self.assertEqual(
+            user_graph["relationships"],
+            [
+                {
+                    "source": "replacement",
+                    "target": "target",
+                    "relationship": "related_to",
+                }
+            ],
+        )
+        self.assertFalse(
+            any(
+                edge["source"] == "old-source"
+                or edge["target"] == "old-source"
+                for edge in user_graph["relationships"]
+            )
+        )
+
     def test_exactly_200_recovery_records_are_valid(self):
         expected_queue = self.write_recovery_queue(200)
         recovery = self.graph.get_relationship_recovery("user-a")
@@ -2028,6 +2378,65 @@ class CliAndSessionTests(unittest.TestCase):
         self.assertIn("replacement ID: replacement-1", output.getvalue())
         self.assertIn("Source replaced.", output.getvalue())
 
+    def test_relationship_recovery_cli_enroll_and_source_apply(self):
+        recovery_calls = []
+        enrollment_calls = []
+
+        class FakeAgent:
+            def __init__(self, user_id):
+                self.user_id = user_id
+                self.memory = types.SimpleNamespace()
+                self.graph = types.SimpleNamespace()
+
+            def enroll_relationship_recovery(self, source_id):
+                enrollment_calls.append(source_id)
+                return {"status": "enrolled"}
+
+            def recover_relationships(self, dry_run=True, source_id=None):
+                recovery_calls.append((dry_run, source_id))
+                return {
+                    "dry_run": dry_run,
+                    "batch_limit": 5,
+                    "attempted": 0,
+                    "succeeded": 0,
+                    "succeeded_empty": 0,
+                    "pending": 0,
+                    "failed": 0,
+                    "blocked": 0,
+                    "capped": [],
+                    "eligible": [source_id] if source_id else [],
+                    "invalid_records": [],
+                    "remaining": 0,
+                    "details": [],
+                }
+
+        with patch.object(main_module, "Agent", FakeAgent), patch.object(
+            main_module, "load_user", return_value="user-a"
+        ):
+            commands = iter(
+                [
+                    "/recover-relationships --enroll source",
+                    "/recover-relationships --apply-source source",
+                    "/recover-relationships",
+                    "/recover-relationships --apply",
+                    "exit",
+                ]
+            )
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(enrollment_calls, ["source"])
+        self.assertEqual(
+            recovery_calls,
+            [(False, "source"), (True, None), (False, None)],
+        )
+        self.assertIn("No generation was run.", output.getvalue())
+        self.assertIn("Relationship recovery for source source:", output.getvalue())
+
     def test_save_rejects_blank_ids_and_persistence_failure_preserves_file(self):
         for value in ("", "  ", None, 2):
             with self.subTest(value=value):
@@ -2495,6 +2904,272 @@ class CliAndSessionTests(unittest.TestCase):
             ), contextlib.redirect_stdout(output):
                 main()
         self.assertIn("1 --related_to--> 2", output.getvalue())
+
+
+class EventPollingDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def make_agent(responses):
+        agent = Agent.__new__(Agent)
+        agent.memory = types.SimpleNamespace(
+            get_event=Mock(side_effect=responses)
+        )
+        return agent
+
+    @staticmethod
+    def event_response(status, results=None, error=None, status_code=200):
+        event = {"status": status}
+        if results is not None:
+            event["results"] = results
+        if error is not None:
+            event["error"] = error
+        return types.SimpleNamespace(
+            status_code=status_code,
+            json=lambda: event,
+        )
+
+    def test_pending_event_retries_until_success(self):
+        agent = self.make_agent(
+            [
+                self.event_response("RUNNING"),
+                self.event_response(
+                    "SUCCEEDED",
+                    results=[{"id": "sensitive-memory-id"}],
+                ),
+            ]
+        )
+        output = io.StringIO()
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            output
+        ):
+            memory_id = agent.get_memory_id(
+                "sensitive-event-id",
+                attempts=3,
+                delay=1,
+            )
+
+        logs = output.getvalue()
+        self.assertEqual(memory_id, "sensitive-memory-id")
+        self.assertEqual(sleep.call_count, 1)
+        self.assertIn("http=success, result=pending", logs)
+        self.assertIn("http=success, result=succeeded_with_memory_id", logs)
+        self.assertIn("result=pending", logs)
+        self.assertIn("result=succeeded_with_memory_id", logs)
+        self.assertIn("outcome=resolved", logs)
+        self.assertIn("request_ms=", logs)
+        self.assertIn("sleep_ms=", logs)
+        self.assertNotIn("sensitive-event-id", logs)
+        self.assertNotIn("sensitive-memory-id", logs)
+
+    def test_pending_timeout_remains_unresolved_and_keeps_sleep_count(self):
+        agent = self.make_agent(
+            [
+                self.event_response("RUNNING"),
+                self.event_response("PENDING"),
+            ]
+        )
+        output = io.StringIO()
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            output
+        ):
+            memory_id = agent.get_memory_id(
+                "sensitive-event-id",
+                attempts=2,
+                delay=1,
+            )
+
+        logs = output.getvalue()
+        self.assertIsNone(memory_id)
+        self.assertEqual(agent.memory.get_event.call_count, 2)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("result=pending", logs)
+        self.assertIn("outcome=timeout", logs)
+        self.assertIn("(failure;", logs)
+        self.assertNotIn("outcome=resolved", logs)
+        self.assertNotIn("sensitive-event-id", logs)
+
+    def test_success_without_memory_id_is_not_reported_as_resolved(self):
+        agent = self.make_agent(
+            [self.event_response("SUCCEEDED", results=[{}])]
+        )
+        output = io.StringIO()
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            output
+        ):
+            memory_id = agent.get_memory_id(
+                "event-id",
+                attempts=3,
+                delay=1,
+            )
+
+        logs = output.getvalue()
+        self.assertIsNone(memory_id)
+        sleep.assert_not_called()
+        self.assertIn("http=success, result=succeeded_without_memory_id", logs)
+        self.assertIn("outcome=succeeded_without_memory_id", logs)
+        self.assertIn("(failure;", logs)
+
+    def test_failed_event_is_terminal_and_logs_no_error_details(self):
+        agent = self.make_agent(
+            [
+                self.event_response(
+                    "FAILED",
+                    error="sensitive failure detail",
+                )
+            ]
+        )
+        output = io.StringIO()
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            output
+        ):
+            memory_id = agent.get_memory_id(
+                "sensitive-event-id",
+                attempts=3,
+                delay=1,
+            )
+
+        logs = output.getvalue()
+        self.assertIsNone(memory_id)
+        sleep.assert_not_called()
+        self.assertIn("result=failed", logs)
+        self.assertIn("outcome=failed", logs)
+        self.assertNotIn("sensitive-event-id", logs)
+        self.assertNotIn("sensitive failure detail", logs)
+
+    def test_retrieval_exception_retries_and_logs_only_safe_category(self):
+        agent = self.make_agent(
+            [
+                RuntimeError("sensitive-event-id secret detail"),
+                self.event_response(
+                    "SUCCEEDED",
+                    results=[{"id": "sensitive-memory-id"}],
+                ),
+            ]
+        )
+        output = io.StringIO()
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            output
+        ):
+            memory_id = agent.get_memory_id(
+                "sensitive-event-id",
+                attempts=3,
+                delay=1,
+            )
+
+        logs = output.getvalue()
+        self.assertEqual(memory_id, "sensitive-memory-id")
+        self.assertEqual(sleep.call_count, 1)
+        self.assertIn("result=exception", logs)
+        self.assertIn("result=succeeded_with_memory_id", logs)
+        self.assertIn("http=exception, result=exception", logs)
+        self.assertNotIn("sensitive-event-id", logs)
+        self.assertNotIn("sensitive-memory-id", logs)
+        self.assertNotIn("secret detail", logs)
+
+    def test_unknown_and_http_error_categories_retry(self):
+        agent = self.make_agent(
+            [
+                self.event_response("UNRECOGNIZED"),
+                self.event_response(
+                    "PENDING",
+                    status_code=503,
+                ),
+                self.event_response(
+                    "SUCCEEDED",
+                    results=[{"id": "memory-id"}],
+                ),
+            ]
+        )
+        output = io.StringIO()
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            output
+        ):
+            memory_id = agent.get_memory_id(
+                "event-id",
+                attempts=3,
+                delay=1,
+            )
+
+        logs = output.getvalue()
+        self.assertEqual(memory_id, "memory-id")
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("result=unknown_status", logs)
+        self.assertIn("result=http_error", logs)
+
+
+class RespondLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def make_agent(was_updated, should_remember=True):
+        agent = Agent.__new__(Agent)
+        agent.user_id = "user-a"
+        agent.memory = types.SimpleNamespace(
+            get_all=Mock(return_value={"results": []})
+        )
+        agent.recall = Mock(return_value={"results": []})
+        agent.update_memory = Mock(return_value=was_updated)
+        agent.decide_memory = Mock(return_value=should_remember)
+        agent.remember = Mock()
+        agent.client = types.SimpleNamespace(
+            models=FakeModels(["offline answer"])
+        )
+        agent.conversation_history = []
+        agent.max_history = 10
+        return agent
+
+    def test_successful_update_skips_decision_and_preserves_response(self):
+        agent = self.make_agent(was_updated=True)
+        agent.recall.side_effect = [
+            {
+                "results": [
+                    {
+                        "id": "memory-1",
+                        "memory": "Existing fact",
+                        "score": 0.9,
+                        "metadata": {},
+                    }
+                ]
+            },
+            {"results": []},
+        ]
+
+        response = agent.respond("Updated fact")
+
+        self.assertEqual(response, "offline answer")
+        agent.decide_memory.assert_not_called()
+        agent.remember.assert_not_called()
+        agent.update_memory.assert_called_once()
+        self.assertEqual(agent.recall.call_count, 2)
+        self.assertEqual(
+            agent.conversation_history,
+            [
+                {"role": "user", "text": "Updated fact"},
+                {"role": "assistant", "text": "offline answer"},
+            ],
+        )
+
+    def test_no_update_still_decides_and_stores_when_approved(self):
+        agent = self.make_agent(was_updated=False, should_remember=True)
+
+        response = agent.respond("A durable fact")
+
+        self.assertEqual(response, "offline answer")
+        agent.decide_memory.assert_called_once_with("A durable fact")
+        agent.remember.assert_called_once_with(
+            "A durable fact",
+            "offline answer",
+        )
+        self.assertEqual(
+            agent.conversation_history,
+            [
+                {"role": "user", "text": "A durable fact"},
+                {"role": "assistant", "text": "offline answer"},
+            ],
+        )
 
 
 class DependencyTests(unittest.TestCase):
