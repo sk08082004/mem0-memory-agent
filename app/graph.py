@@ -354,60 +354,66 @@ class KnowledgeGraph:
         with self._lock:
             if user_graph is None:
                 user_graph = self.graph.get(user_id, {})
-            if not isinstance(user_graph, dict):
-                return {
-                    "valid": False,
-                    "records": [],
-                    "invalid_records": [str(user_graph)],
-                    "blocked_count": 1,
-                    "queue_size": 0,
-                    "error": "User graph is malformed.",
-                }
+            return self.validate_relationship_recovery(user_graph)
 
-            queue = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY, {})
-            if not isinstance(queue, dict):
-                return {
-                    "valid": False,
-                    "records": [],
-                    "invalid_records": [str(queue)[:self.MAX_RECOVERY_ERROR_LENGTH]],
-                    "blocked_count": 1,
-                    "queue_size": 0,
-                    "error": "Relationship recovery queue is malformed.",
-                }
-            if len(queue) > self.MAX_RECOVERY_RECORDS:
-                queue_size = len(queue)
-                return {
-                    "valid": False,
-                    "records": [],
-                    "invalid_records": [],
-                    "blocked_count": queue_size,
-                    "queue_size": queue_size,
-                    "error": (
-                        f"Relationship recovery queue has {queue_size} records, "
-                        f"exceeding the limit of {self.MAX_RECOVERY_RECORDS}. "
-                        "No records were changed or processed. Review and resolve "
-                        "records manually before retrying recovery."
-                    ),
-                }
-
-            records = []
-            invalid_records = []
-            for source_id, record in queue.items():
-                if not self._valid_recovery_record(record) or source_id != record.get(
-                    "source_id"
-                ):
-                    invalid_records.append(str(source_id))
-                    continue
-                records.append(copy.deepcopy(record))
-
+    @classmethod
+    def validate_relationship_recovery(cls, user_graph):
+        if not isinstance(user_graph, dict):
             return {
-                "valid": True,
-                "records": records,
-                "invalid_records": invalid_records,
-                "blocked_count": len(invalid_records),
-                "queue_size": len(queue),
-                "error": None,
+                "valid": False,
+                "records": [],
+                "invalid_records": [str(user_graph)],
+                "blocked_count": 1,
+                "queue_size": 0,
+                "error": "User graph is malformed.",
             }
+
+        queue = user_graph.get(cls.RELATIONSHIP_RECOVERY_KEY, {})
+        if not isinstance(queue, dict):
+            return {
+                "valid": False,
+                "records": [],
+                "invalid_records": [
+                    str(queue)[:cls.MAX_RECOVERY_ERROR_LENGTH]
+                ],
+                "blocked_count": 1,
+                "queue_size": 0,
+                "error": "Relationship recovery queue is malformed.",
+            }
+        if len(queue) > cls.MAX_RECOVERY_RECORDS:
+            queue_size = len(queue)
+            return {
+                "valid": False,
+                "records": [],
+                "invalid_records": [],
+                "blocked_count": queue_size,
+                "queue_size": queue_size,
+                "error": (
+                    f"Relationship recovery queue has {queue_size} records, "
+                    f"exceeding the limit of {cls.MAX_RECOVERY_RECORDS}. "
+                    "No records were changed or processed. Review and resolve "
+                    "records manually before retrying recovery."
+                ),
+            }
+
+        records = []
+        invalid_records = []
+        for source_id, record in queue.items():
+            if not cls._valid_recovery_record(record) or source_id != record.get(
+                "source_id"
+            ):
+                invalid_records.append(str(source_id))
+                continue
+            records.append(copy.deepcopy(record))
+
+        return {
+            "valid": True,
+            "records": records,
+            "invalid_records": invalid_records,
+            "blocked_count": len(invalid_records),
+            "queue_size": len(queue),
+            "error": None,
+        }
 
     def create_relationship_recovery(self, user_id, source_id):
         if (

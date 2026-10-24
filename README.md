@@ -258,9 +258,42 @@ python -m app.main
 
 On first launch, the agent prompts for a user ID and stores it in `session.json` so the same user can be reused on subsequent runs.
 
+## Primary operations dashboard
+
+The read-only dashboard is the primary interface for monitoring and exploring
+Mem0 memory and relationship-recovery state. Launch it from the repository
+root:
+
+```bash
+streamlit run app/dashboard.py
+```
+
+Enter the local user ID and graph file path in the sidebar, then load the
+snapshot. The dashboard reads only the selected user's graph from the existing
+JSON file. It does not call Mem0 or Gemini and does not modify graph, session,
+or recovery data. Recovery actions remain available through the CLI.
+
+The user ID field scopes a local file lookup; it is **not authentication**.
+Do not expose the dashboard to a public network until sign-in and server-side
+authorization are in place.
+
+## Deployment and persistence status
+
+The application is not cloud-ready. The CLI still persists its active user in
+`session.json` and graph nodes, relationships, and recovery records in
+`graph.json`. The dashboard currently reads the JSON graph through a
+provider-style snapshot interface so a PostgreSQL-backed read provider can be
+introduced without embedding storage parsing in the UI. This does not migrate
+the CLI or establish a cloud source of truth.
+
+The existing Mem0 Cloud and Gemini integrations remain external services;
+their API keys must be supplied through environment variables or deployment
+secrets and must never be committed.
+
 ## Notes
 
-- This project is the CLI version of the memory agent.
-- There is no frontend implementation in the current repository.
-- Knowledge Graph, analytics dashboard, and benchmarking are not part of the current implementation and are not documented as completed features in this README.
-- The system is intended to be conversational, memory-aware, and persistent across sessions while remaining focused on CLI usage.
+- Use the dashboard as the primary view for memory, graph, recovery, and
+  integrity status. Use the command-line agent for memory and recovery
+  operations that change data.
+- The dashboard is read-only and reports historical performance as unavailable
+  because operation timings are not persisted.

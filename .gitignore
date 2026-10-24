@@ -1,7 +1,84 @@
+
+# Python virtual environments
 .venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+.streamlit/secrets.toml
+
+# Private keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python cache and generated files
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+
+# Local application state
+/session.json
+/graph.json
+/session.json.*
+/graph.json.*
+
+# Specific runtime lock files
+/session.json.lock
+/graph.json.lock
+
+# Local backups and temporary files
+*.bak
+*.backup
+*.backup-*
+*.before-restore-*
+*.tmp
+*.temp
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+# Logs and temporary output
+*.log
+logs/
+tmp/
+temp/
+cache/
+
+# Preserve existing project rule
 future*.txt
-session.json
-graph.json
+
+# Build artifacts
+build/
+dist/
+.eggs/
+site/
+
+# Other generated files
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+desktop.ini
+node_modules/
+
+# Local screenshots
+/dashboard img folder/
