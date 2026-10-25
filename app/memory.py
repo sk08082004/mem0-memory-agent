@@ -31,14 +31,15 @@ class MemoryManager:
 
         return result
 
-    def get_event(self, event_id):
+    def get_event(self, event_id, timeout_seconds=None):
         """
         Get the status of a Mem0 background event.
         """
 
-        return self.client.client.get(
-            f"/v1/event/{event_id}/"
-        )
+        url = f"/v1/event/{event_id}/"
+        if timeout_seconds is None:
+            return self.client.client.get(url)
+        return self.client.client.get(url, timeout=timeout_seconds)
 
     def search(self, query, user_id):
         """

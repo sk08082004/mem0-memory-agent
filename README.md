@@ -1,6 +1,6 @@
 ﻿# Mem0 Long-Term Memory Agent
 
-A CLI-first long-term memory AI assistant built with Python, Google Gemini, and Mem0 for persistent context across conversations.
+A local long-term memory AI assistant built with Python, Google Gemini, Mem0, a Streamlit dashboard, and a CLI for diagnostics and administration.
 
 ## Overview
 
@@ -14,6 +14,38 @@ This project extends Gemini with a long-term memory layer so the agent can remem
 - `google-genai`
 - `python-dotenv`
 - CLI-based workflow
+- Streamlit dashboard for conversation and read-only monitoring
+
+## Dashboard
+
+Install the dependencies from `requirements.txt`, configure `GEMINI_API_KEY`
+and `MEM0_API_KEY`, then start the local dashboard from the repository root:
+
+```powershell
+streamlit run app/dashboard.py
+```
+
+Conversation is the dashboard's default page. It calls the existing
+`Agent.respond()` pipeline, so memory retrieval, updates, and relationship
+safeguards remain agent-managed. Conversation transcripts are stored in the
+git-ignored local file `data/conversations.json`, scoped to the selected local
+user, and written atomically. This is local persistence, not cloud storage or
+authentication. The transcript is separate from long-term Mem0 facts;
+starting or deleting a conversation does not clear or mutate memories. The
+sidebar searches conversation titles and messages and supports switching,
+renaming, and deleting transcripts. If a local write fails, the current
+browser session keeps the unsaved conversation visible and retries the save
+when storage becomes available; keep the page open until the warning clears.
+The existing CLI remains available for diagnostics and administrative
+operations.
+
+Technical commands remain available directly in the conversation composer.
+`/help` uses the same command list in the dashboard and CLI. Commands run
+locally rather than being sent to Gemini, and command output is marked
+separately from normal assistant responses. Destructive `/clear` asks for
+confirmation in the dashboard; `exit` keeps its CLI meaning and does not stop
+the Streamlit app. Natural-language messages continue through the regular
+agent response pipeline.
 
 ## Current architecture
 
@@ -54,6 +86,33 @@ Important information is stored in Mem0 and persists across application restarts
 
 - Long-term memories are retrieved semantically, not by simple keyword matching.
 - Stored memories remain available for future sessions and user interactions.
+
+### Mem0 event and graph synchronization reliability
+
+Each extracted fact remains an independent Mem0 memory. Mem0 writes are
+followed by bounded event polling; the defaults are an 8-second polling
+deadline, a 250 ms initial interval, and a 1-second maximum backoff interval.
+Set `MEM0_EVENT_TIMEOUT_SECONDS`,
+`MEM0_EVENT_POLL_INTERVAL_SECONDS`, or
+`MEM0_EVENT_POLL_MAX_INTERVAL_SECONDS` to tune those values. Event HTTP
+requests use the remaining polling time as their request timeout.
+
+When Mem0 accepts a write but its result cannot yet be verified, the agent
+preserves the original event ID and memory text in the per-user graph operation
+ledger. It does not blindly repeat that write or create a graph node under an
+unverified ID. Use `/reconcile-memory-events [limit]` in the CLI or dashboard
+chat to recheck pending events and synchronize confirmed memories. A confirmed
+Mem0 memory whose graph node or relationships are still pending is reported as
+partial success rather than full synchronization. Polling attempts, sleep
+duration, Mem0 writes, graph persistence, and relationship generation are
+included in the response timing metadata.
+
+Graph relationships use stable Mem0 IDs, an allowlist of directed labels, and
+exact text evidence from both endpoint memories. Generic `related_to` edges,
+missing endpoints, and duplicate directed edges are rejected or omitted.
+Relationship repairs are written as atomic edge deltas with a per-user revision
+journal; `KnowledgeGraph.rollback_relationship_revision(user_id, revision_id)`
+can restore the prior edges without changing memory nodes.
 
 ### Intelligent memory decisions
 

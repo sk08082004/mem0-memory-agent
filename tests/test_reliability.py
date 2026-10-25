@@ -66,9 +66,11 @@ class FakeModels:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        self.last_prompt = None
 
     def generate_content(self, **kwargs):
         self.calls += 1
+        self.last_prompt = kwargs.get("contents")
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -355,6 +357,321 @@ def evolution_response(memory_id="old", text="updated fact"):
 
 
 class MemoryLifecycleTests(unittest.TestCase):
+    def test_exact_duplicate_extractions_are_written_once(self):
+        agent = make_agent()
+        agent.memory = FakeMemory(add_result={"event_id": "event-1"})
+        agent.last_response_metadata = {
+            "memory_activity": [],
+            "timings_ms": {},
+        }
+        agent.client = types.SimpleNamespace(
+            models=FakeModels(
+                [
+                    json.dumps(
+                        {
+                            "memories": [
+                                {"text": "User prefers Python."},
+                                {"text": "  USER   PREFERS PYTHON.  "},
+                            ]
+                        }
+                    )
+                ]
+            )
+        )
+        agent.deduplicate_memory = lambda *args: False
+        agent.get_memory_id = lambda event_id: "memory-1"
+        agent.create_memory_relationships = lambda *args: True
+
+        self.assertTrue(agent.remember("same fact twice", "answer"))
+        self.assertEqual(len(agent.memory.added), 1)
+        self.assertEqual(
+            agent.memory.added[0]["messages"][0]["content"],
+            "User prefers Python.",
+        )
+
+    def test_multiple_independent_extracted_facts_remain_atomic(self):
+        agent = make_agent()
+        agent.memory = FakeMemory(add_result={"event_id": "event"})
+        agent.last_response_metadata = {
+            "memory_activity": [],
+            "timings_ms": {},
+        }
+        agent.client = types.SimpleNamespace(
+            models=FakeModels(
+                [
+                    json.dumps(
+                        {
+                            "memories": [
+                                {"text": "User prefers Python."},
+                                {"text": "User works on a mobile app."},
+                            ]
+                        }
+                    )
+                ]
+            )
+        )
+        agent.deduplicate_memory = lambda *args: False
+        agent.get_memory_id = lambda event_id: (
+            f"memory-{len(agent.memory.added)}"
+        )
+        agent.create_memory_relationships = lambda *args: True
+
+        self.assertTrue(agent.remember("two facts", "answer"))
+        self.assertEqual(len(agent.memory.added), 2)
+        self.assertEqual(
+            [
+                item["messages"][0]["content"]
+                for item in agent.memory.added
+            ],
+            ["User prefers Python.", "User works on a mobile app."],
+        )
+
+    def test_uncertain_write_is_not_repeated_after_pending_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = make_agent()
+            agent.graph = KnowledgeGraph(
+                os.path.join(directory, "graph.json")
+            )
+            agent.memory = FakeMemory(add_result={"event_id": "event-1"})
+            agent.last_response_metadata = {
+                "memory_activity": [],
+                "timings_ms": {},
+            }
+            agent.get_memory_id = lambda event_id: None
+
+            result = agent._write_memory_and_sync(
+                [{"role": "user", "content": "User prefers Python."}],
+                "User prefers Python.",
+                {"source": "conversation"},
+            )
+            self.assertEqual(result["status"], "timeout")
+            self.assertEqual(
+                agent.graph.get_pending_mem0_operations("user-a")[0][
+                    "event_id"
+                ],
+                "event-1",
+            )
+
+            agent.client = types.SimpleNamespace(
+                models=FakeModels([memory_extraction("User prefers Python.")])
+            )
+            agent._reconcile_matching_memory_operation = (
+                lambda *args, **kwargs: "pending"
+            )
+            agent.deduplicate_memory = Mock()
+
+            self.assertTrue(agent.remember("same fact", "answer"))
+            self.assertEqual(len(agent.memory.added), 1)
+            agent.deduplicate_memory.assert_not_called()
+
+    def test_uncertain_dedup_merge_does_not_trigger_a_second_add(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = make_agent()
+            agent.graph = KnowledgeGraph(
+                os.path.join(directory, "graph.json")
+            )
+            agent.memory = FakeMemory(
+                add_error=RuntimeError("synthetic transport failure")
+            )
+            agent.last_response_metadata = {
+                "memory_activity": [],
+                "timings_ms": {},
+            }
+            agent.recall = lambda query: {
+                "results": [
+                    {
+                        "id": "existing",
+                        "memory": "User likes Python.",
+                        "score": 0.9,
+                    }
+                ]
+            }
+            agent.client = types.SimpleNamespace(
+                models=FakeModels(
+                    [
+                        memory_extraction("User prefers Python."),
+                        json.dumps(
+                            {
+                                "duplicate_memory_ids": ["existing"],
+                                "merged_memory": "User prefers Python.",
+                            }
+                        ),
+                    ]
+                )
+            )
+
+            self.assertTrue(agent.remember("same fact", "answer"))
+            self.assertEqual(len(agent.memory.added), 1)
+            self.assertEqual(agent.memory.deleted, [])
+            pending = agent.graph.get_pending_mem0_operations("user-a")
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["status"], "outcome_uncertain")
+
+    def test_reconciliation_confirms_event_before_creating_graph_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = make_agent()
+            agent.graph = KnowledgeGraph(
+                os.path.join(directory, "graph.json")
+            )
+            operation = agent.graph.record_mem0_operation(
+                "user-a",
+                "event-1",
+                "Confirmed memory",
+                "pending",
+            )
+            response = types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "status": "SUCCEEDED",
+                    "results": [{"id": "verified-memory"}],
+                },
+            )
+            agent.memory = types.SimpleNamespace(
+                get_event=lambda event_id, timeout_seconds=None: response
+            )
+            agent.last_response_metadata = {
+                "memory_activity": [],
+                "timings_ms": {},
+            }
+            relationships = []
+            agent.create_memory_relationships = (
+                lambda memory_id, text: relationships.append(
+                    (memory_id, text)
+                ) or True
+            )
+
+            report = agent.reconcile_pending_memory_events(
+                limit=1,
+                timeout_seconds=0.5,
+            )
+
+            self.assertEqual(report["synchronized"], 1)
+            self.assertEqual(report["pending"], 0)
+            self.assertEqual(
+                agent.graph.get_user_graph("user-a")["nodes"],
+                [{"id": "verified-memory", "memory_text": "Confirmed memory"}],
+            )
+            self.assertEqual(
+                relationships,
+                [("verified-memory", "Confirmed memory")],
+            )
+            self.assertEqual(
+                agent.graph.get_pending_mem0_operations("user-a"),
+                [],
+            )
+            self.assertEqual(
+                operation["event_id"],
+                "event-1",
+            )
+
+    def test_reconciliation_finishes_confirmed_memory_update_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = make_agent()
+            agent.graph = KnowledgeGraph(
+                os.path.join(directory, "graph.json")
+            )
+            agent.graph.add_node("user-a", "old-memory", "Old fact")
+            agent.graph.create_relationship_recovery(
+                "user-a",
+                "old-memory",
+            )
+            agent.graph.record_mem0_operation(
+                "user-a",
+                "update-event",
+                "Updated fact",
+                "pending",
+                operation_type="update",
+                related_memory_ids=["old-memory"],
+            )
+            response = types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "status": "SUCCEEDED",
+                    "results": [{"id": "replacement-memory"}],
+                },
+            )
+            agent.memory = FakeMemory(delete_result={"success": True})
+            agent.memory.get_event = (
+                lambda event_id, timeout_seconds=None: response
+            )
+            agent.last_response_metadata = {
+                "memory_activity": [],
+                "timings_ms": {},
+            }
+            agent.create_memory_relationships = lambda *args: True
+
+            report = agent.reconcile_pending_memory_events(
+                limit=1,
+                timeout_seconds=0.5,
+            )
+
+            self.assertEqual(agent.memory.deleted, ["old-memory"])
+            self.assertEqual(report["synchronized"], 1)
+            user_graph = agent.graph.get_user_graph("user-a")
+            self.assertEqual(
+                [node["id"] for node in user_graph["nodes"]],
+                ["replacement-memory"],
+            )
+            self.assertEqual(
+                user_graph["relationship_recovery"]["old-memory"][
+                    "status"
+                ],
+                "superseded",
+            )
+            self.assertEqual(
+                agent.graph.get_pending_mem0_operations("user-a"),
+                [],
+            )
+
+    def test_pending_update_is_reconciled_instead_of_written_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = make_agent()
+            agent.graph = KnowledgeGraph(
+                os.path.join(directory, "graph.json")
+            )
+            agent.graph.add_node("user-a", "old", "Old fact")
+            agent.graph.record_mem0_operation(
+                "user-a",
+                "update-event",
+                "updated fact",
+                "pending",
+                operation_type="update",
+                related_memory_ids=["old"],
+            )
+            event = types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "status": "SUCCEEDED",
+                    "results": [{"id": "replacement"}],
+                },
+            )
+            agent.memory = FakeMemory(delete_result={"success": True})
+            agent.memory.get_event = (
+                lambda event_id, timeout_seconds=None: event
+            )
+            agent.client = types.SimpleNamespace(
+                models=FakeModels([evolution_response(text="updated fact")])
+            )
+            agent.last_response_metadata = {
+                "memory_activity": [],
+                "timings_ms": {},
+            }
+            agent.create_memory_relationships = lambda *args: True
+
+            updated = agent.update_memory(
+                "new information",
+                [MemoryLifecycleTests.old_memory()],
+            )
+
+            self.assertTrue(updated)
+            self.assertTrue(agent._last_update_handled)
+            self.assertEqual(agent.memory.added, [])
+            self.assertEqual(agent.memory.deleted, ["old"])
+            self.assertEqual(
+                [node["id"] for node in agent.graph.get_user_graph("user-a")["nodes"]],
+                ["replacement"],
+            )
+
     def test_successful_insertion_adds_confirmed_graph_node(self):
         agent = make_agent()
         agent.memory = FakeMemory(add_result={"event_id": "event-1"})
@@ -603,7 +920,7 @@ class MemoryLifecycleTests(unittest.TestCase):
             self.assertEqual(graph.graph, before_graph)
             with open(path, "rb") as graph_file:
                 self.assertEqual(graph_file.read(), before_file)
-            self.assertEqual(agent.memory.deleted, ["old"])
+            self.assertEqual(agent.memory.deleted, [])
 
     def test_deduplication_confirms_replacement_then_deletes_unique_ids(self):
         agent = make_agent()
@@ -972,6 +1289,21 @@ class PaginationTests(unittest.TestCase):
         manager.client = self.Client(pages=pages, error=error)
         return manager
 
+    def test_event_poll_uses_remaining_request_timeout(self):
+        manager = MemoryManager.__new__(MemoryManager)
+        http_client = Mock()
+        manager.client = types.SimpleNamespace(client=http_client)
+
+        manager.get_event("event-1", timeout_seconds=1.25)
+        http_client.get.assert_called_once_with(
+            "/v1/event/event-1/",
+            timeout=1.25,
+        )
+
+        http_client.get.reset_mock()
+        manager.get_event("event-2")
+        http_client.get.assert_called_once_with("/v1/event/event-2/")
+
     def test_complete_multi_page_retrieval(self):
         manager = self.manager_for(
             {
@@ -1120,6 +1452,209 @@ class KnowledgeGraphTests(unittest.TestCase):
             self.graph.add_relationship("user-a", "b1", "a1", "cross_user")
         )
         self.assertEqual(self.graph.get_user_graph("user-b")["relationships"], [])
+
+    def test_relationship_revision_is_atomic_and_reversible(self):
+        self.graph.add_node("user-a", "project", "Apollo")
+        self.graph.add_node("user-a", "backend", "Apollo backend")
+        self.graph.add_node("user-b", "private", "Other partition")
+        self.graph.add_relationship(
+            "user-a",
+            "backend",
+            "project",
+            "uses",
+        )
+        original_nodes = copy.deepcopy(
+            self.graph.get_user_graph("user-a")["nodes"]
+        )
+
+        result = self.graph.apply_relationship_revision(
+            "user-a",
+            "audit-fix",
+            "Correct Apollo backend edge direction.",
+            [
+                {
+                    "source": "backend",
+                    "target": "project",
+                    "relationship": "uses",
+                }
+            ],
+            [
+                {
+                    "source": "project",
+                    "target": "backend",
+                    "relationship": "has_backend",
+                    "evidence_ids": ["project", "backend"],
+                }
+            ],
+        )
+
+        self.assertEqual(result["status"], "applied")
+        user_graph = self.graph.get_user_graph("user-a")
+        self.assertEqual(user_graph["nodes"], original_nodes)
+        self.assertEqual(
+            user_graph["relationships"],
+            [
+                {
+                    "source": "project",
+                    "target": "backend",
+                    "relationship": "has_backend",
+                    "evidence_ids": ["project", "backend"],
+                }
+            ],
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-b")["nodes"][0]["id"],
+            "private",
+        )
+        self.assertEqual(
+            self.graph.rollback_relationship_revision("user-a", "audit-fix")[
+                "status"
+            ],
+            "reverted",
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["relationships"],
+            [
+                {
+                    "source": "backend",
+                    "target": "project",
+                    "relationship": "uses",
+                }
+            ],
+        )
+
+    def test_relationship_revision_rejects_missing_or_duplicate_edges(self):
+        self.graph.add_node("user-a", "project", "Apollo")
+
+        with self.assertRaisesRegex(ValueError, "missing endpoint"):
+            self.graph.apply_relationship_revision(
+                "user-a",
+                "missing",
+                "Reject unverified endpoints.",
+                [],
+                [
+                    {
+                        "source": "project",
+                        "target": "missing",
+                        "relationship": "has_backend",
+                    }
+                ],
+            )
+
+        with self.assertRaisesRegex(ValueError, "duplicate edges"):
+            self.graph.apply_relationship_revision(
+                "user-a",
+                "duplicate",
+                "Reject duplicate deltas.",
+                [],
+                [
+                    {
+                        "source": "project",
+                        "target": "other",
+                        "relationship": "has_backend",
+                    },
+                    {
+                        "source": "project",
+                        "target": "other",
+                        "relationship": "has_backend",
+                    },
+                ],
+            )
+        self.assertNotIn(
+            KnowledgeGraph.RELATIONSHIP_REVISIONS_KEY,
+            self.graph.get_user_graph("user-a"),
+        )
+
+    def test_mem0_operation_requires_verified_id_before_graph_commit(self):
+        operation = self.graph.record_mem0_operation(
+            "user-a",
+            "event-1",
+            "A saved memory",
+            "pending",
+        )
+
+        self.assertFalse(
+            self.graph.reconcile_mem0_operation(
+                "user-a",
+                operation["operation_id"],
+                "unverified-id",
+            )
+        )
+        self.assertEqual(self.graph.get_user_graph("user-a")["nodes"], [])
+        self.assertEqual(
+            self.graph.get_pending_mem0_operations("user-a")[0]["event_id"],
+            "event-1",
+        )
+
+        self.assertTrue(
+            self.graph.update_mem0_operation(
+                "user-a",
+                operation["operation_id"],
+                "succeeded",
+                memory_id="verified-id",
+            )
+        )
+        self.assertTrue(
+            self.graph.reconcile_mem0_operation(
+                "user-a",
+                operation["operation_id"],
+                "verified-id",
+            )
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["nodes"],
+            [{"id": "verified-id", "memory_text": "A saved memory"}],
+        )
+        self.assertEqual(
+            self.graph.get_pending_mem0_operations("user-a"),
+            [],
+        )
+
+    def test_mem0_replacement_reconciliation_is_atomic_on_save_failure(self):
+        self.graph.add_node("user-a", "old", "Old memory")
+        self.graph.create_relationship_recovery("user-a", "old")
+        operation = self.graph.record_mem0_operation(
+            "user-a",
+            "event-1",
+            "Replacement memory",
+            "pending",
+            operation_type="update",
+            related_memory_ids=["old"],
+        )
+        self.graph.update_mem0_operation(
+            "user-a",
+            operation["operation_id"],
+            "succeeded",
+            memory_id="replacement",
+        )
+        self.graph.reconcile_mem0_operation(
+            "user-a",
+            operation["operation_id"],
+            "replacement",
+            retain_operation=True,
+        )
+        self.graph.update_mem0_operation(
+            "user-a",
+            operation["operation_id"],
+            "succeeded",
+            memory_id="replacement",
+            deleted_related_memory_ids=["old"],
+        )
+        before_graph = copy.deepcopy(self.graph.graph)
+
+        with patch.object(
+            self.graph,
+            "save",
+            side_effect=OSError("synthetic disk failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic disk failure"):
+                self.graph.reconcile_mem0_replacement_operation(
+                    "user-a",
+                    operation["operation_id"],
+                    "replacement",
+                )
+
+        self.assertEqual(self.graph.graph, before_graph)
 
     def test_missing_invalid_and_cross_user_endpoints_leave_graph_unchanged(self):
         self.graph.add_node("user-a", "a1", "A one")
@@ -1793,14 +2328,28 @@ class RelationshipRecoveryTests(unittest.TestCase):
     def _forbidden_mem0(*args, **kwargs):
         raise AssertionError("Relationship recovery must not call Mem0.")
 
-    @staticmethod
-    def relationship_response(target_id="target", relationship="related_to"):
+    def relationship_response(
+        self,
+        target_id="target",
+        relationship="has_milestone",
+        source_id="source",
+    ):
+        memories = {
+            node["id"]: node["memory_text"]
+            for node in self.graph.get_user_graph("user-a")["nodes"]
+        }
+        evidence = [
+            {"memory_id": source_id, "quote": memories[source_id][:500]},
+            {"memory_id": target_id, "quote": memories[target_id][:500]},
+        ]
         return json.dumps(
             {
                 "relationships": [
                     {
+                        "source_id": source_id,
                         "target_id": target_id,
                         "relationship": relationship,
+                        "evidence": evidence,
                     }
                 ]
             }
@@ -1809,6 +2358,178 @@ class RelationshipRecoveryTests(unittest.TestCase):
     def add_source_and_target(self, source="source", target="target"):
         self.graph.add_node("user-a", source, "Source memory")
         self.graph.add_node("user-a", target, "Target memory")
+
+    def test_relationship_generation_keeps_directed_mem0_ids_and_evidence(self):
+        self.graph.add_node("user-a", "source", "Apollo project")
+        self.graph.add_node("user-a", "target", "FastAPI backend for Apollo")
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels(
+                [self.relationship_response(relationship="has_backend")]
+            )
+        )
+
+        edges = self.agent._generate_relationship_edges("source")
+
+        self.assertEqual(
+            edges,
+            [
+                {
+                    "source_id": "source",
+                    "target_id": "target",
+                    "relationship": "has_backend",
+                    "evidence_ids": ["source", "target"],
+                }
+            ],
+        )
+        prompt = self.agent.client.models.last_prompt
+        self.assertIn("stable Mem0 memory IDs", prompt)
+        self.assertIn("source_id", prompt)
+        self.assertIn("evidence", prompt)
+
+    def test_relationship_generation_rejects_generic_labels(self):
+        self.add_source_and_target()
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels(
+                [self.relationship_response(relationship="related_to")]
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid endpoints or label"):
+            self.agent._generate_relationship_edges("source")
+
+    def test_relationship_generation_rejects_missing_endpoints(self):
+        self.add_source_and_target()
+        response = {
+            "relationships": [
+                {
+                    "source_id": "source",
+                    "target_id": "not-in-this-user-graph",
+                    "relationship": "has_milestone",
+                    "evidence": [
+                        {"memory_id": "source", "quote": "Source memory"},
+                        {
+                            "memory_id": "not-in-this-user-graph",
+                            "quote": "missing",
+                        },
+                    ],
+                }
+            ]
+        }
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([json.dumps(response)])
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid endpoints or label"):
+            self.agent._generate_relationship_edges("source")
+
+    def test_relationship_generation_rejects_unverifiable_evidence(self):
+        self.add_source_and_target()
+        response = json.loads(self.relationship_response())
+        response["relationships"][0]["evidence"][1]["quote"] = (
+            "Unrelated unsupported claim"
+        )
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([json.dumps(response)])
+        )
+
+        with self.assertRaisesRegex(ValueError, "must quote existing memory text"):
+            self.agent._generate_relationship_edges("source")
+
+    def test_relationship_generation_deduplicates_duplicate_directed_edges(self):
+        self.add_source_and_target()
+        response = json.loads(self.relationship_response())
+        response["relationships"].append(
+            copy.deepcopy(response["relationships"][0])
+        )
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels([json.dumps(response)])
+        )
+
+        self.assertEqual(
+            len(self.agent._generate_relationship_edges("source")),
+            1,
+        )
+
+    def test_weakly_related_memories_produce_no_edges(self):
+        self.graph.add_node(
+            "user-a",
+            "transformer",
+            "Transformer uses attention without recurrence.",
+        )
+        self.graph.add_node(
+            "user-a",
+            "lstm",
+            "The LSTM forget gate uses a sigmoid layer.",
+        )
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels(['{"relationships": []}'])
+        )
+
+        self.assertEqual(
+            self.agent._generate_relationship_edges("transformer"),
+            [],
+        )
+        self.assertIn("shared topic", self.agent.client.models.last_prompt)
+
+    def test_prerequisite_chain_can_use_two_non_recovery_endpoints(self):
+        self.graph.add_node("user-a", "chain", "Apollo phase dependencies")
+        self.graph.add_node(
+            "user-a",
+            "dataset",
+            "Apollo dataset preparation deadline is November 5.",
+        )
+        self.graph.add_node(
+            "user-a",
+            "evaluation",
+            "Apollo model evaluation is scheduled for November 18.",
+        )
+        self.graph.create_relationship_recovery("user-a", "chain")
+        self.agent.client = types.SimpleNamespace(
+            models=FakeModels(
+                [
+                    json.dumps(
+                        {
+                            "relationships": [
+                                {
+                                    "source_id": "dataset",
+                                    "target_id": "evaluation",
+                                    "relationship": "prerequisite_for",
+                                    "evidence": [
+                                        {
+                                            "memory_id": "dataset",
+                                            "quote": "dataset preparation",
+                                        },
+                                        {
+                                            "memory_id": "evaluation",
+                                            "quote": "model evaluation",
+                                        },
+                                        {
+                                            "memory_id": "chain",
+                                            "quote": "phase dependencies",
+                                        },
+                                    ],
+                                }
+                            ]
+                        }
+                    )
+                ]
+            )
+        )
+
+        self.assertTrue(
+            self.agent._generate_tracked_relationships("chain", 3)
+        )
+        self.assertEqual(
+            self.graph.get_user_graph("user-a")["relationships"],
+            [
+                {
+                    "source": "dataset",
+                    "target": "evaluation",
+                    "relationship": "prerequisite_for",
+                    "evidence_ids": ["dataset", "evaluation", "chain"],
+                }
+            ],
+        )
 
     def prepare_replacement_provenance(self):
         self.graph.add_node("user-a", "old-source", "Old memory")
@@ -2456,7 +3177,9 @@ class RelationshipRecoveryTests(unittest.TestCase):
         self.graph.add_node("user-a", "other-source", "Other source")
         self.graph.create_relationship_recovery("user-a", source_id)
         self.graph.create_relationship_recovery("user-a", "other-source")
-        models = FakeModels([self.relationship_response()])
+        models = FakeModels(
+            [self.relationship_response(source_id=source_id)]
+        )
         self.agent.client = types.SimpleNamespace(models=models)
 
         preview = self.agent.recover_relationships(dry_run=True)
@@ -2683,7 +3406,9 @@ class RelationshipRecoveryTests(unittest.TestCase):
         old_record_before = copy.deepcopy(old_record)
         self.graph.add_node("user-a", "replacement", "Replacement memory")
         self.agent.client = types.SimpleNamespace(
-            models=FakeModels([self.relationship_response()])
+            models=FakeModels(
+                [self.relationship_response(source_id="replacement")]
+            )
         )
 
         self.assertEqual(
@@ -2708,7 +3433,8 @@ class RelationshipRecoveryTests(unittest.TestCase):
                 {
                     "source": "replacement",
                     "target": "target",
-                    "relationship": "related_to",
+                    "relationship": "has_milestone",
+                    "evidence_ids": ["replacement", "target"],
                 }
             ],
         )
@@ -2787,7 +3513,8 @@ class RelationshipRecoveryTests(unittest.TestCase):
                 {
                     "source": "source",
                     "target": "target",
-                    "relationship": "related_to",
+                    "relationship": "has_milestone",
+                    "evidence_ids": ["source", "target"],
                 }
             ],
         )
@@ -3365,6 +4092,42 @@ class CliAndSessionTests(unittest.TestCase):
         )
         self.assertIn("replacement ID: replacement-1", output.getvalue())
         self.assertIn("Source replaced.", output.getvalue())
+
+    def test_mem0_event_reconciliation_is_available_in_cli(self):
+        calls = []
+
+        class FakeAgent:
+            def __init__(self, user_id):
+                self.user_id = user_id
+
+            def reconcile_pending_memory_events(self, limit):
+                calls.append(limit)
+                return {
+                    "checked": 1,
+                    "synchronized": 1,
+                    "pending": 0,
+                    "failed": 0,
+                    "details": [
+                        {
+                            "operation_type": "add",
+                            "status": "memory_saved_graph_synchronized",
+                        }
+                    ],
+                }
+
+        with patch.object(main_module, "Agent", FakeAgent), patch.object(
+            main_module, "load_user", return_value="user-a"
+        ):
+            commands = iter(["/reconcile-memory-events 2", "exit"])
+            output = io.StringIO()
+            with patch(
+                "builtins.input",
+                side_effect=lambda prompt="": next(commands),
+            ), contextlib.redirect_stdout(output):
+                main()
+
+        self.assertEqual(calls, [2])
+        self.assertIn("Graph synchronized: 1", output.getvalue())
 
     def test_relationship_recovery_cli_enroll_and_source_apply(self):
         recovery_calls = []
@@ -4263,11 +5026,64 @@ class EventPollingDiagnosticsTests(unittest.TestCase):
         self.assertIn("http=success, result=succeeded_with_memory_id", logs)
         self.assertIn("result=pending", logs)
         self.assertIn("result=succeeded_with_memory_id", logs)
-        self.assertIn("outcome=resolved", logs)
+        self.assertIn("outcome=succeeded", logs)
         self.assertIn("request_ms=", logs)
         self.assertIn("sleep_ms=", logs)
         self.assertNotIn("sensitive-event-id", logs)
         self.assertNotIn("sensitive-memory-id", logs)
+        self.assertGreater(
+            agent.memory.get_event.call_args_list[0].kwargs["timeout_seconds"],
+            0,
+        )
+
+    def test_pending_event_succeeds_after_several_pending_results(self):
+        agent = self.make_agent(
+            [
+                self.event_response("RUNNING"),
+                self.event_response("PROCESSING"),
+                self.event_response("PENDING"),
+                self.event_response(
+                    "SUCCEEDED",
+                    results=[{"id": "confirmed-memory"}],
+                ),
+            ]
+        )
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            memory_id = agent.get_memory_id(
+                "event-id",
+                attempts=5,
+                delay=0.1,
+            )
+
+        self.assertEqual(memory_id, "confirmed-memory")
+        self.assertEqual(agent.memory.get_event.call_count, 4)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_event_success_on_first_attempt_does_not_sleep_or_poll_again(self):
+        agent = self.make_agent(
+            [
+                self.event_response(
+                    "SUCCEEDED",
+                    results=[{"id": "verified-memory-id"}],
+                )
+            ]
+        )
+
+        with patch("app.agent.time.sleep") as sleep, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            memory_id = agent.get_memory_id(
+                "event-id",
+                attempts=5,
+                delay=1,
+            )
+
+        self.assertEqual(memory_id, "verified-memory-id")
+        agent.memory.get_event.assert_called_once()
+        sleep.assert_not_called()
 
     def test_pending_timeout_remains_unresolved_and_keeps_sleep_count(self):
         agent = self.make_agent(
@@ -4290,7 +5106,7 @@ class EventPollingDiagnosticsTests(unittest.TestCase):
         logs = output.getvalue()
         self.assertIsNone(memory_id)
         self.assertEqual(agent.memory.get_event.call_count, 2)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
         self.assertIn("result=pending", logs)
         self.assertIn("outcome=timeout", logs)
         self.assertIn("(failure;", logs)
@@ -4471,12 +5287,41 @@ class RespondLifecycleTests(unittest.TestCase):
             "A durable fact",
             "offline answer",
         )
+        agent.memory.get_all.assert_not_called()
+        self.assertIn(
+            {"action": "update", "status": "none"},
+            agent.last_response_metadata["memory_activity"],
+        )
+        self.assertGreaterEqual(
+            agent.last_response_metadata["timings_ms"]["agent_execution"],
+            agent.last_response_metadata["timings_ms"]["gemini_response"],
+        )
+
+    def test_short_contextual_followup_can_use_bounded_memory_fallback(self):
+        self.assertTrue(Agent._needs_memory_fallback("Move it to tomorrow"))
+        self.assertFalse(
+            Agent._needs_memory_fallback(
+                "I am starting a separate project about local history"
+            )
+        )
+
+    def test_memory_search_failure_is_not_reported_as_empty_recall(self):
+        agent = Agent.__new__(Agent)
+        agent.user_id = "user-a"
+        agent.memory = types.SimpleNamespace(
+            search=Mock(side_effect=RuntimeError("synthetic Mem0 failure"))
+        )
+        agent.last_response_metadata = {
+            "memory_activity": [],
+            "timings_ms": {},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic Mem0 failure"):
+            agent.recall("question")
+
         self.assertEqual(
-            agent.conversation_history,
-            [
-                {"role": "user", "text": "A durable fact"},
-                {"role": "assistant", "text": "offline answer"},
-            ],
+            agent.last_response_metadata["memory_activity"],
+            [{"action": "retrieval", "status": "failed"}],
         )
 
 

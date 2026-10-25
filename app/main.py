@@ -1,6 +1,8 @@
 from app.agent import Agent
 from app.config import SESSION_FILE
+from app.conversation import MEMORY_OUTCOME_LABELS
 from app.performance import finish_timer, start_timer
+from app.commands import dispatch_chat_command, format_command_help
 import json
 import os
 import tempfile
@@ -203,6 +205,25 @@ def main():
         if user_input.lower() == "exit":
             print("Goodbye!")
             break
+
+        command_parts = user_input.split(maxsplit=1)
+        if (
+            command_parts
+            and command_parts[0].casefold() == "/reconcile-memory-events"
+        ):
+            command_start = start_timer()
+            result = dispatch_chat_command(
+                agent,
+                user_input,
+                user_id=user_id,
+            )
+            print(f"\n{result['text']}\n")
+            finish_timer(
+                "Command /reconcile-memory-events",
+                command_start,
+                result["status"] == "success",
+            )
+            continue
 
         # Show memories command
         if user_input.lower() == "/memories":
@@ -1023,27 +1044,7 @@ def main():
 
         # Help command
         if user_input.lower() == "/help":
-            print("""
-Available commands:
-
-/memories              View all stored memories.
-/memory-info <num>     Show detailed memory provenance.
-/graph                 View the knowledge graph. 
-/recover-relationships Preview relationship recovery; append --apply to apply.
-/recover-relationships --enroll <memory_id>  Track one graph node for recovery.
-/recover-relationships --apply-source <memory_id> Apply recovery for one source.
-/recover-relationships --inspect-source <memory_id> Inspect one source without changes.
-/recover-relationships --verify-remote-source <memory_id> Verify a source in Mem0.
-/recover-relationships --restore-local-source <memory_id> Restore a verified local source.
-/forget <num>          Delete a specific memory.
-/clear                 Delete all memories.
-/new                   Start a new conversation.
-/user                  Show current user.
-/login <user_id>       Switch to another user.
-/logout                Logout and choose another user.
-/help                  Show the help message.
-exit                   Exit the agent
-            """)
+            print(f"\n{format_command_help()}\n")
             continue
 
         # New conversation command
@@ -1059,6 +1060,12 @@ exit                   Exit the agent
         # Normal conversation
         response = agent.respond(user_input)
         print(f"\nAgent: {response}\n")
+        response_metadata = getattr(agent, "last_response_metadata", {})
+        if isinstance(response_metadata, dict):
+            for outcome in response_metadata.get("memory_outcomes", []):
+                label = MEMORY_OUTCOME_LABELS.get(outcome)
+                if label:
+                    print(f"[MEMORY STATUS] {label}\n")
 
 
 if __name__ == "__main__":

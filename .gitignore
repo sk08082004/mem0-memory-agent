@@ -39,6 +39,8 @@ htmlcov/
 /graph.json
 /session.json.*
 /graph.json.*
+/data/conversations.json
+/data/conversations.json.lock
 
 # Specific runtime lock files
 /session.json.lock

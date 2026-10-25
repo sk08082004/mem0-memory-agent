@@ -1,13 +1,13 @@
+import math
 import os
 import logging
 import json
 import copy
 import hashlib
+import time
 from platform import node
 import traceback
 
-
-import time
 
 from app.performance import timed_operation
 from app.recovery import evaluate_relationship_recovery
@@ -21,11 +21,68 @@ from app.memory import MemoryManager
 from app.graph import KnowledgeGraph
 
 
+def _event_poll_details(metrics):
+    return (
+        f"attempts={metrics.get('attempts', 0)}, "
+        f"request_ms={metrics.get('request_ms', 0.0):.2f}, "
+        f"sleep_ms={metrics.get('sleep_ms', 0.0):.2f}, "
+        f"outcome={metrics.get('outcome', 'unknown')}"
+    )
+
+
 class Agent:
     """AI agent with long-term memory."""
 
     RELATIONSHIP_RECOVERY_BATCH_LIMIT = 5
     RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT = 3
+    RELATIONSHIP_LABELS = {
+        "has_backend",
+        "uses_backend",
+        "has_milestone",
+        "has_deadline",
+        "prerequisite_for",
+        "has_prerequisite",
+        "developed_on",
+        "runs_on",
+        "uses",
+        "implements",
+        "reports_performance_of",
+        "demonstrates_generalization_of",
+        "applies_to",
+        "part_of",
+        "member_of",
+        "located_in",
+        "studies",
+        "prefers",
+        "interested_in",
+        "motivated_by",
+        "describes",
+        "measured_on",
+    }
+    CONTEXT_REFERENCE_WORDS = {
+        "it",
+        "that",
+        "this",
+        "same",
+        "other",
+        "one",
+        "them",
+        "there",
+        "he",
+        "she",
+        "they",
+    }
+
+    @classmethod
+    def _needs_memory_fallback(cls, message):
+        words = {
+            word.strip(".,!?;:'\"()[]{}").casefold()
+            for word in message.split()
+        }
+        return (
+            len(words) <= 8
+            and bool(words & cls.CONTEXT_REFERENCE_WORDS)
+        )
 
     def __init__(self, user_id):
         self.user_id = user_id
@@ -51,6 +108,29 @@ class Agent:
 
         self.conversation_history = []
         self.max_history = 10
+        self.last_response_metadata = {
+            "memory_activity": [],
+            "timings_ms": {},
+        }
+
+    def _record_memory_activity(self, action, status, count=None):
+        metadata = getattr(self, "last_response_metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        activity = metadata.setdefault("memory_activity", [])
+        event = {"action": action, "status": status}
+        if isinstance(count, int) and count >= 0:
+            event["count"] = count
+        activity.append(event)
+
+    def _record_response_timing(self, name, started_at):
+        metadata = getattr(self, "last_response_metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        timings = metadata.setdefault("timings_ms", {})
+        timings[name] = timings.get(name, 0.0) + (
+            time.perf_counter() - started_at
+        ) * 1000
 
     @staticmethod
     def _normalize_confidence(value, default=0.5):
@@ -201,127 +281,944 @@ class Agent:
 
         return merged_metadata
 
-    def get_memory_id(self, event_id, attempts=30, delay=1):
-        metrics = {}
-        with timed_operation("Mem0 event polling total") as outcome:
-            memory_id = self._get_memory_id(
-                event_id,
-                attempts,
-                delay,
-                metrics,
-            )
-            outcome["succeeded"] = memory_id is not None
-            outcome["details"] = (
-                f"attempts={metrics.get('attempts', 0)}, "
-                f"request_ms={metrics.get('request_ms', 0.0):.2f}, "
-                f"sleep_ms={metrics.get('sleep_ms', 0.0):.2f}, "
-                f"outcome={metrics.get('outcome', 'unknown')}"
-            )
-            return memory_id
+    def get_memory_id(
+        self,
+        event_id,
+        attempts=None,
+        delay=None,
+        timeout_seconds=None,
+    ):
+        result = self.resolve_memory_event(
+            event_id,
+            attempts=attempts,
+            delay=delay,
+            timeout_seconds=timeout_seconds,
+        )
+        self._last_event_resolution = result
+        return result["memory_id"]
 
-    def _get_memory_id(self, event_id, attempts, delay, metrics=None):
-        """
-        Wait for a Mem0 add event to finish
-        and return the actual memory ID.
-        """
+    def resolve_memory_event(
+        self,
+        event_id,
+        attempts=None,
+        delay=None,
+        timeout_seconds=None,
+    ):
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise ValueError("A valid Mem0 event ID is required.")
+        try:
+            configured_timeout = float(
+                os.getenv("MEM0_EVENT_TIMEOUT_SECONDS", "8")
+            )
+            configured_interval = float(
+                os.getenv("MEM0_EVENT_POLL_INTERVAL_SECONDS", "0.25")
+            )
+            configured_max_interval = float(
+                os.getenv("MEM0_EVENT_POLL_MAX_INTERVAL_SECONDS", "1")
+            )
+        except ValueError as error:
+            raise ValueError(
+                "Mem0 event polling environment settings must be numbers."
+            ) from error
+        timeout_seconds = (
+            configured_timeout if timeout_seconds is None else timeout_seconds
+        )
+        interval = configured_interval if delay is None else delay
+        max_attempts = attempts if attempts is not None else 120
+        try:
+            finite_intervals = all(
+                math.isfinite(float(value))
+                for value in (
+                    timeout_seconds,
+                    interval,
+                    configured_max_interval,
+                )
+            )
+        except (OverflowError, TypeError, ValueError):
+            finite_intervals = False
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or timeout_seconds < 0
+            or not finite_intervals
+            or not isinstance(interval, (int, float))
+            or isinstance(interval, bool)
+            or interval <= 0
+            or not isinstance(configured_max_interval, (int, float))
+            or configured_max_interval <= 0
+            or configured_max_interval < interval
+            or type(max_attempts) is not int
+            or max_attempts < 1
+        ):
+            raise ValueError("Mem0 event polling configuration is invalid.")
 
-        metrics = metrics if metrics is not None else {}
-        metrics.update({
+        deadline = time.monotonic() + timeout_seconds
+        next_interval = float(interval)
+        metrics = {
             "attempts": 0,
             "request_ms": 0.0,
             "sleep_ms": 0.0,
             "outcome": "timeout",
-        })
+            "memory_id": None,
+        }
         pending_statuses = {
             "PENDING",
             "RUNNING",
             "PROCESSING",
             "IN_PROGRESS",
         }
-
-        def sleep_for_retry():
-            sleep_start = time.perf_counter()
-            time.sleep(delay)
-            elapsed_ms = (time.perf_counter() - sleep_start) * 1000
-            metrics["sleep_ms"] += elapsed_ms
-            return elapsed_ms
-
-        for attempt in range(1, attempts + 1):
-            metrics["attempts"] = attempt
-            request_start = time.perf_counter()
-            request_ms = 0.0
-            sleep_ms = 0.0
-            request_status = "exception"
-            result_category = "exception"
-            try:
+        started_at = time.perf_counter()
+        with timed_operation("Mem0 event polling total") as timing:
+            for attempt in range(1, max_attempts + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                metrics["attempts"] = attempt
+                request_start = time.perf_counter()
+                request_ms = 0.0
+                request_status = "exception"
+                result_category = "exception"
                 try:
-                    response = self.memory.get_event(event_id)
+                    response = self.memory.get_event(
+                        event_id,
+                        timeout_seconds=remaining,
+                    )
+                    request_ms = (time.perf_counter() - request_start) * 1000
+                    metrics["request_ms"] += request_ms
                     request_status = (
                         "success"
                         if response.status_code == 200
-                        else "error"
+                        else f"http_{response.status_code}"
+                    )
+                    if response.status_code != 200:
+                        result_category = "http_error"
+                    else:
+                        event = response.json()
+                        status = (
+                            event.get("status")
+                            if isinstance(event, dict)
+                            else None
+                        )
+                        normalized_status = (
+                            status.upper() if isinstance(status, str) else ""
+                        )
+                        if normalized_status == "SUCCEEDED":
+                            results = event.get("results", [])
+                            memory_id = next(
+                                (
+                                    item.get("id")
+                                    for item in results
+                                    if (
+                                        isinstance(item, dict)
+                                        and isinstance(item.get("id"), str)
+                                        and item["id"].strip()
+                                    )
+                                ),
+                                None,
+                            ) if isinstance(results, list) else None
+                            if memory_id:
+                                result_category = "succeeded_with_memory_id"
+                                metrics["outcome"] = "succeeded"
+                                metrics["memory_id"] = memory_id
+                            else:
+                                result_category = "succeeded_without_memory_id"
+                                metrics["outcome"] = (
+                                    "succeeded_without_memory_id"
+                                )
+                            self._record_response_timing(
+                                "memory_event_polling",
+                                started_at,
+                            )
+                            self._record_poll_metrics(metrics)
+                            timing["succeeded"] = bool(memory_id)
+                            timing["details"] = _event_poll_details(metrics)
+                            self._log_event_poll(
+                                attempt,
+                                request_status,
+                                result_category,
+                                request_ms,
+                                0,
+                            )
+                            return {
+                                "status": metrics["outcome"],
+                                "event_id": event_id,
+                                "memory_id": memory_id,
+                                **metrics,
+                            }
+                        if normalized_status == "FAILED":
+                            result_category = "failed"
+                            metrics["outcome"] = "failed"
+                            self._record_response_timing(
+                                "memory_event_polling",
+                                started_at,
+                            )
+                            self._record_poll_metrics(metrics)
+                            timing["succeeded"] = False
+                            timing["details"] = _event_poll_details(metrics)
+                            self._log_event_poll(
+                                attempt,
+                                request_status,
+                                result_category,
+                                request_ms,
+                                0,
+                            )
+                            return {
+                                "status": "failed",
+                                "event_id": event_id,
+                                **metrics,
+                            }
+                        result_category = (
+                            "pending"
+                            if normalized_status in pending_statuses
+                            else "unknown_status"
+                        )
+                except Exception as error:
+                    if request_ms == 0.0:
+                        request_ms = (
+                            time.perf_counter() - request_start
+                        ) * 1000
+                        metrics["request_ms"] += request_ms
+                    result_category = (
+                        f"exception_{type(error).__name__}"
+                    )
+
+                remaining = deadline - time.monotonic()
+                sleep_ms = 0.0
+                if remaining > 0 and attempt < max_attempts:
+                    sleep_seconds = min(next_interval, remaining)
+                    sleep_start = time.perf_counter()
+                    time.sleep(sleep_seconds)
+                    sleep_ms = (time.perf_counter() - sleep_start) * 1000
+                    metrics["sleep_ms"] += sleep_ms
+                    next_interval = min(
+                        next_interval * 2,
+                        configured_max_interval,
+                    )
+                self._log_event_poll(
+                    attempt,
+                    request_status,
+                    result_category,
+                    request_ms,
+                    sleep_ms,
+                )
+                if remaining <= 0 or attempt >= max_attempts:
+                    break
+
+            metrics["outcome"] = "timeout"
+            timing["succeeded"] = False
+            timing["details"] = _event_poll_details(metrics)
+
+        self._record_response_timing("memory_event_polling", started_at)
+        self._record_poll_metrics(metrics)
+        print("[GRAPH] Timed out waiting for Mem0 event; reconciliation is required.")
+        return {
+            "status": "timeout",
+            "event_id": event_id,
+            **metrics,
+        }
+
+    def _record_poll_metrics(self, metrics):
+        metadata = getattr(self, "last_response_metadata", None)
+        if isinstance(metadata, dict):
+            polling = metadata.setdefault("polling", {})
+            polling["attempts"] = polling.get("attempts", 0) + metrics["attempts"]
+            polling["sleep_ms"] = polling.get("sleep_ms", 0.0) + metrics["sleep_ms"]
+
+    def _record_memory_outcome(self, status):
+        metadata = getattr(self, "last_response_metadata", None)
+        if isinstance(metadata, dict):
+            metadata.setdefault("memory_outcomes", []).append(status)
+
+    @staticmethod
+    def _log_event_poll(attempt, http_status, result, request_ms, sleep_ms):
+        print(
+            f"[TIME] Mem0 event poll attempt {attempt}: "
+            f"http={http_status}, result={result}, "
+            f"request_ms={request_ms:.2f}, sleep_ms={sleep_ms:.2f}"
+        )
+
+    def _pending_mem0_operations(self):
+        get_pending = getattr(self.graph, "get_pending_mem0_operations", None)
+        if not callable(get_pending):
+            return []
+        return get_pending(self.user_id)
+
+    def _record_mem0_operation(
+        self,
+        event_id,
+        memory_text,
+        status,
+        operation_type,
+        related_memory_ids,
+        memory_id=None,
+    ):
+        record = getattr(self.graph, "record_mem0_operation", None)
+        if callable(record):
+            return record(
+                self.user_id,
+                event_id,
+                memory_text,
+                status,
+                operation_type=operation_type,
+                related_memory_ids=related_memory_ids,
+                memory_id=memory_id,
+            )
+        return None
+
+    def _update_mem0_operation(
+        self,
+        operation_id,
+        status,
+        memory_id=None,
+        deleted_related_memory_ids=None,
+    ):
+        update = getattr(self.graph, "update_mem0_operation", None)
+        if callable(update) and operation_id:
+            return update(
+                self.user_id,
+                operation_id,
+                status,
+                memory_id=memory_id,
+                deleted_related_memory_ids=deleted_related_memory_ids,
+            )
+        return False
+
+    def _commit_mem0_operation(
+        self,
+        operation,
+        memory_id,
+        retain_operation=False,
+    ):
+        reconcile = getattr(self.graph, "reconcile_mem0_operation", None)
+        if callable(reconcile):
+            return reconcile(
+                self.user_id,
+                operation["operation_id"],
+                memory_id,
+                retain_operation=retain_operation,
+            )
+        self.graph.add_node(
+            self.user_id,
+            memory_id,
+            operation["memory_text"],
+        )
+        return True
+
+    def _finish_confirmed_mem0_operation(self, operation, memory_id):
+        operation_id = operation["operation_id"]
+        replacement_operation = operation["operation_type"] in {
+            "update",
+            "merge",
+        }
+        graph_started = time.perf_counter()
+        try:
+            if not self._update_mem0_operation(
+                operation_id,
+                "succeeded",
+                memory_id=memory_id,
+            ):
+                return "graph_synchronization_pending"
+            synced = self._commit_mem0_operation(
+                operation,
+                memory_id,
+                retain_operation=replacement_operation,
+            )
+        except Exception as error:
+            print(
+                "[MEMORY] Mem0 memory was confirmed, but graph "
+                f"synchronization is pending: {error}"
+            )
+            return "graph_synchronization_pending"
+        finally:
+            self._record_response_timing(
+                "graph_persistence",
+                graph_started,
+            )
+        if not synced:
+            return "graph_synchronization_pending"
+
+        if replacement_operation:
+            deleted_ids = set(
+                operation.get("deleted_related_memory_ids", [])
+            )
+            for related_id in operation["related_memory_ids"]:
+                if related_id in deleted_ids:
+                    continue
+                if related_id == memory_id:
+                    deleted_ids.add(related_id)
+                    graph_started = time.perf_counter()
+                    try:
+                        progress_saved = self._update_mem0_operation(
+                            operation_id,
+                            "succeeded",
+                            memory_id=memory_id,
+                            deleted_related_memory_ids=sorted(deleted_ids),
+                        )
+                    finally:
+                        self._record_response_timing(
+                            "graph_persistence",
+                            graph_started,
+                        )
+                    if not progress_saved:
+                        return "replacement_cleanup_pending"
+                    continue
+                try:
+                    deleted = self.memory.delete(related_id)
+                except Exception as error:
+                    print(
+                        "[MEMORY] Replacement memory is confirmed, but "
+                        f"deletion of related memory {related_id} failed: "
+                        f"{error}"
+                    )
+                    return "replacement_cleanup_pending"
+                if not self._delete_succeeded(deleted):
+                    print(
+                        "[MEMORY] Replacement memory is confirmed, but "
+                        f"deletion of related memory {related_id} was not "
+                        "confirmed."
+                    )
+                    return "replacement_cleanup_pending"
+                deleted_ids.add(related_id)
+                graph_started = time.perf_counter()
+                try:
+                    progress_saved = self._update_mem0_operation(
+                        operation_id,
+                        "succeeded",
+                        memory_id=memory_id,
+                        deleted_related_memory_ids=sorted(deleted_ids),
                     )
                 finally:
-                    request_ms = (
-                        time.perf_counter() - request_start
-                    ) * 1000
-                    metrics["request_ms"] += request_ms
+                    self._record_response_timing(
+                        "graph_persistence",
+                        graph_started,
+                    )
+                if not progress_saved:
+                    print(
+                        "[MEMORY] Related memory deletion was confirmed, "
+                        "but its reconciliation state could not be saved."
+                    )
+                    return "replacement_cleanup_pending"
 
-                if response.status_code != 200:
-                    result_category = "http_error"
-                    sleep_ms = sleep_for_retry()
-                else:
-                    event = response.json()
-                    status = event.get("status")
-
-                    if status == "SUCCEEDED":
-                        results = event.get("results", [])
-                        memory_id = None
-
-                        if isinstance(results, list):
-                            for item in results:
-                                if isinstance(item, dict):
-                                    memory_id = item.get("id")
-                                    if memory_id:
-                                        break
-
-                        if memory_id:
-                            result_category = "succeeded_with_memory_id"
-                            metrics["outcome"] = "resolved"
-                            return memory_id
-
-                        result_category = "succeeded_without_memory_id"
-                        metrics["outcome"] = "succeeded_without_memory_id"
-                        return None
-
-                    if status == "FAILED":
-                        result_category = "failed"
-                        metrics["outcome"] = "failed"
-                        print("[GRAPH] Mem0 event failed.")
-                        return None
-
-                    if isinstance(status, str) and status.upper() in pending_statuses:
-                        result_category = "pending"
-                    else:
-                        result_category = "unknown_status"
-                    sleep_ms = sleep_for_retry()
-
-            except Exception as e:
-                result_category = "exception"
-                metrics["outcome"] = "exception"
-                print("[GRAPH] Could not retrieve Mem0 event.")
-                sleep_ms = sleep_for_retry()
-            finally:
+            reconcile_replacement = getattr(
+                self.graph,
+                "reconcile_mem0_replacement_operation",
+                None,
+            )
+            if not callable(reconcile_replacement):
+                return "graph_synchronization_pending"
+            try:
+                graph_started = time.perf_counter()
+                replacement_result = reconcile_replacement(
+                    self.user_id,
+                    operation_id,
+                    memory_id,
+                )
+            except Exception as error:
+                self._record_response_timing(
+                    "graph_persistence",
+                    graph_started,
+                )
                 print(
-                    f"[TIME] Mem0 event poll attempt {attempt}: "
-                    f"http={request_status}, "
-                    f"result={result_category}, "
-                    f"request_ms={request_ms:.2f}, "
-                    f"sleep_ms={sleep_ms:.2f}"
+                    "[MEMORY] Related Mem0 memories were deleted, but "
+                    f"atomic graph replacement is pending: {error}"
+                )
+                return "graph_synchronization_pending"
+            self._record_response_timing(
+                "graph_persistence",
+                graph_started,
+            )
+            if replacement_result.get("status") != "reconciled":
+                return "graph_synchronization_pending"
+
+        try:
+            relationships_synced = self.create_memory_relationships(
+                memory_id,
+                operation["memory_text"],
+            )
+        except Exception as error:
+            print(
+                "[MEMORY] Memory and graph node are saved, but relationship "
+                f"synchronization failed: {error}"
+            )
+            return "memory_saved_relationships_pending"
+        if relationships_synced:
+            return "synchronized"
+        return (
+            "memory_saved_relationships_untracked"
+            if getattr(self, "_last_relationship_status", "pending")
+            == "untracked"
+            else "memory_saved_relationships_pending"
+        )
+
+    def _write_memory_and_sync(
+        self,
+        messages,
+        memory_text,
+        metadata,
+        operation_type="add",
+        related_memory_ids=None,
+        timeout_seconds=None,
+        create_relationships=True,
+    ):
+        response_metadata = getattr(self, "last_response_metadata", None)
+        if isinstance(response_metadata, dict):
+            response_metadata["memory_writes"] = (
+                response_metadata.get("memory_writes", 0) + 1
+            )
+        add_started = time.perf_counter()
+        try:
+            add_result = self.memory.add(
+                messages,
+                self.user_id,
+                metadata=metadata,
+            )
+        except Exception as error:
+            self._record_response_timing("mem0_add", add_started)
+            try:
+                self._record_mem0_operation(
+                    None,
+                    memory_text,
+                    "outcome_uncertain",
+                    operation_type,
+                    related_memory_ids,
+                )
+            except Exception as ledger_error:
+                print(
+                    "[MEMORY] Mem0 add raised an error and its uncertain "
+                    f"outcome could not be persisted: {ledger_error}"
+                )
+            self._record_memory_activity("save", "uncertain", 1)
+            self._record_memory_outcome("outcome_uncertain")
+            print(
+                "[MEMORY] Mem0 add outcome is uncertain; no retry was made. "
+                f"Diagnostic: {error}"
+            )
+            return {"status": "outcome_uncertain"}
+        self._record_response_timing("mem0_add", add_started)
+
+        if not isinstance(add_result, dict) or not add_result:
+            try:
+                self._record_mem0_operation(
+                    None,
+                    memory_text,
+                    "outcome_uncertain",
+                    operation_type,
+                    related_memory_ids,
+                )
+            except Exception as error:
+                print(
+                    "[MEMORY] Add result was incomplete and its uncertain "
+                    f"outcome could not be persisted: {error}"
+                )
+            self._record_memory_activity("save", "uncertain", 1)
+            self._record_memory_outcome("outcome_uncertain")
+            print(
+                "[MEMORY] Mem0 returned no verifiable event ID; outcome is "
+                "uncertain and the write will not be retried automatically."
+            )
+            return {"status": "outcome_uncertain"}
+
+        event_id = add_result.get("event_id")
+        if not isinstance(event_id, str) or not event_id.strip():
+            try:
+                self._record_mem0_operation(
+                    None,
+                    memory_text,
+                    "outcome_uncertain",
+                    operation_type,
+                    related_memory_ids,
+                )
+            except Exception as error:
+                print(
+                    "[MEMORY] Mem0 event ID was missing and its uncertain "
+                    f"outcome could not be persisted: {error}"
+                )
+            self._record_memory_activity("save", "uncertain", 1)
+            self._record_memory_outcome("outcome_uncertain")
+            print(
+                "[MEMORY] Mem0 accepted a write without an event ID; outcome "
+                "is uncertain and it will not be retried automatically."
+            )
+            return {"status": "outcome_uncertain"}
+
+        try:
+            operation = self._record_mem0_operation(
+                event_id,
+                memory_text,
+                "pending",
+                operation_type,
+                related_memory_ids,
+            )
+        except Exception as error:
+            operation = None
+            print(
+                "[MEMORY] Could not persist Mem0 event for reconciliation; "
+                f"event status will still be checked: {error}"
+            )
+
+        self._last_event_resolution = None
+        try:
+            if timeout_seconds is None:
+                memory_id = self.get_memory_id(event_id)
+            else:
+                memory_id = self.get_memory_id(
+                    event_id,
+                    timeout_seconds=timeout_seconds,
+                )
+            resolution = getattr(self, "_last_event_resolution", None)
+            status = (
+                resolution["status"]
+                if isinstance(resolution, dict)
+                else ("succeeded" if memory_id else "timeout")
+            )
+        except Exception as error:
+            memory_id = None
+            status = "timeout"
+            print(
+                "[MEMORY] Mem0 event polling failed; event will be "
+                f"reconciled later: {error}"
+            )
+
+        if not memory_id:
+            operation_status = (
+                "succeeded_without_memory_id"
+                if status == "succeeded_without_memory_id"
+                else "failed"
+                if status == "failed"
+                else "pending"
+            )
+            if operation:
+                graph_started = time.perf_counter()
+                try:
+                    self._update_mem0_operation(
+                        operation["operation_id"],
+                        operation_status,
+                    )
+                except Exception as error:
+                    print(
+                        "[MEMORY] Could not update pending Mem0 operation "
+                        f"state: {error}"
+                    )
+            activity_status = (
+                "failed"
+                if status == "failed"
+                else "pending"
+                if status == "succeeded_without_memory_id"
+                else "uncertain"
+            )
+            self._record_memory_activity("save", activity_status, 1)
+            self._record_memory_outcome(
+                "memory_operation_failed"
+                if status == "failed"
+                else "memory_succeeded_without_memory_id"
+                if status == "succeeded_without_memory_id"
+                else "outcome_uncertain"
+            )
+            print(
+                "[MEMORY] "
+                + (
+                    "Mem0 event failed; no graph node was created."
+                    if status == "failed"
+                    else "Mem0 event succeeded without a confirmed memory ID; "
+                    "graph synchronization is pending."
+                    if status == "succeeded_without_memory_id"
+                    else "Mem0 operation outcome is uncertain; event "
+                    "reconciliation is required and the write will not be "
+                    "repeated."
+                )
+            )
+            return {
+                "status": status,
+                "event_id": event_id,
+                "operation": operation,
+            }
+
+        graph_started = time.perf_counter()
+        if operation:
+            try:
+                self._update_mem0_operation(
+                    operation["operation_id"],
+                    "succeeded",
+                    memory_id=memory_id,
+                )
+                synced = self._commit_mem0_operation(operation, memory_id)
+            except Exception as error:
+                synced = False
+                print(
+                    "[MEMORY] Mem0 memory was confirmed, but graph "
+                    f"synchronization is pending: {error}"
+                )
+            finally:
+                self._record_response_timing(
+                    "graph_persistence",
+                    graph_started,
+                )
+        else:
+            try:
+                self.graph.add_node(self.user_id, memory_id, memory_text)
+                synced = True
+            except Exception as error:
+                synced = False
+                print(
+                    "[MEMORY] Mem0 memory was confirmed, but graph node "
+                    f"creation failed; synchronization is pending: {error}"
+                )
+            finally:
+                self._record_response_timing(
+                    "graph_persistence",
+                    graph_started,
                 )
 
-        print("[GRAPH] Timed out waiting for Mem0 event.")
-        metrics["outcome"] = "timeout"
+        if not synced:
+            self._record_memory_activity("save", "partial", 1)
+            self._record_memory_outcome("memory_saved_graph_pending")
+            return {
+                "status": "saved_graph_pending",
+                "event_id": event_id,
+                "memory_id": memory_id,
+                "operation": operation,
+            }
+        if create_relationships:
+            try:
+                relationships_synced = self.create_memory_relationships(
+                    memory_id,
+                    memory_text,
+                )
+            except Exception as error:
+                relationships_synced = False
+                print(
+                    "[MEMORY] Mem0 memory and graph node were saved, but "
+                    f"relationship synchronization failed: {error}"
+                )
+            if relationships_synced:
+                self._record_memory_activity("save", "completed", 1)
+                self._record_memory_outcome(
+                    "memory_saved_graph_synchronized"
+                )
+            else:
+                relationship_status = getattr(
+                    self,
+                    "_last_relationship_status",
+                    "pending",
+                )
+                self._record_memory_activity("save", "partial", 1)
+                self._record_memory_outcome(
+                    (
+                        "memory_saved_relationships_untracked"
+                        if relationship_status == "untracked"
+                        else "memory_saved_relationships_pending"
+                    )
+                )
+                print(
+                    "[MEMORY] Graph relationship persistence failed; the "
+                    "Mem0 memory and graph node were saved. "
+                    + (
+                        "Recovery tracking could not be recorded."
+                        if relationship_status == "untracked"
+                        else "Relationship recovery remains pending."
+                    )
+                )
+            if not relationships_synced:
+                return {
+                    "status": (
+                        "saved_relationships_untracked"
+                        if getattr(
+                            self,
+                            "_last_relationship_status",
+                            "pending",
+                        ) == "untracked"
+                        else "saved_relationships_pending"
+                    ),
+                    "event_id": event_id,
+                    "memory_id": memory_id,
+                    "operation": operation,
+                }
+        return {
+            "status": "saved_graph_synced",
+            "event_id": event_id,
+            "memory_id": memory_id,
+            "operation": operation,
+        }
+
+    def reconcile_pending_memory_events(
+        self,
+        limit=10,
+        timeout_seconds=1.5,
+    ):
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer.")
+        operations = self._pending_mem0_operations()[:limit]
+        report = {
+            "checked": 0,
+            "synchronized": 0,
+            "pending": 0,
+            "untracked": 0,
+            "failed": 0,
+            "details": [],
+        }
+        for operation in operations:
+            report["checked"] += 1
+            operation_id = operation["operation_id"]
+            event_id = operation.get("event_id")
+            memory_id = (
+                operation.get("memory_id")
+                if operation.get("status") == "succeeded"
+                else None
+            )
+            status = operation["status"]
+            if not memory_id and event_id:
+                resolution = self.resolve_memory_event(
+                    event_id,
+                    timeout_seconds=timeout_seconds,
+                )
+                status = resolution["status"]
+                memory_id = resolution.get("memory_id")
+            if status == "failed":
+                self._update_mem0_operation(operation_id, "failed")
+                report["failed"] += 1
+                report["details"].append(
+                    {"status": "failed", "operation_type": operation["operation_type"]}
+                )
+                continue
+            if not memory_id:
+                if event_id and status in {
+                    "succeeded_without_memory_id",
+                    "timeout",
+                }:
+                    self._update_mem0_operation(
+                        operation_id,
+                        (
+                            "succeeded_without_memory_id"
+                            if status == "succeeded_without_memory_id"
+                            else "pending"
+                        ),
+                    )
+                report["pending"] += 1
+                report["details"].append(
+                    {
+                        "status": (
+                            "succeeded_without_memory_id"
+                            if status == "succeeded_without_memory_id"
+                            else "outcome_uncertain"
+                        ),
+                        "operation_type": operation["operation_type"],
+                    }
+                )
+                continue
+            result_status = self._finish_confirmed_mem0_operation(
+                operation,
+                memory_id,
+            )
+            if result_status == "synchronized":
+                report["synchronized"] += 1
+                report["details"].append(
+                    {
+                        "status": "memory_saved_graph_synchronized",
+                        "operation_type": operation["operation_type"],
+                    }
+                )
+            elif result_status == "memory_saved_relationships_untracked":
+                report["untracked"] += 1
+                report["details"].append(
+                    {
+                        "status": result_status,
+                        "operation_type": operation["operation_type"],
+                    }
+                )
+            else:
+                report["pending"] += 1
+                report["details"].append(
+                    {
+                        "status": result_status,
+                        "operation_type": operation["operation_type"],
+                    }
+                )
+        return report
+
+    @staticmethod
+    def _normalized_memory_text(value):
+        return " ".join(value.casefold().split())
+
+    def _reconcile_matching_memory_operation(
+        self,
+        memory_text,
+        timeout_seconds=1.5,
+        operation_types=None,
+    ):
+        normalized_text = self._normalized_memory_text(memory_text)
+        for operation in self._pending_mem0_operations():
+            if (
+                operation_types is not None
+                and operation["operation_type"] not in operation_types
+            ):
+                continue
+            if (
+                self._normalized_memory_text(operation["memory_text"])
+                != normalized_text
+            ):
+                continue
+            operation_id = operation["operation_id"]
+            event_id = operation.get("event_id")
+            memory_id = (
+                operation.get("memory_id")
+                if operation.get("status") == "succeeded"
+                else None
+            )
+            status = operation["status"]
+            if not memory_id and event_id:
+                resolution = self.resolve_memory_event(
+                    event_id,
+                    timeout_seconds=timeout_seconds,
+                )
+                status = resolution["status"]
+                memory_id = resolution.get("memory_id")
+            if status == "failed":
+                self._update_mem0_operation(operation_id, "failed")
+                continue
+            if not memory_id:
+                if event_id:
+                    self._update_mem0_operation(
+                        operation_id,
+                        (
+                            "succeeded_without_memory_id"
+                            if status == "succeeded_without_memory_id"
+                            else "pending"
+                        ),
+                    )
+                return "pending"
+            result_status = self._finish_confirmed_mem0_operation(
+                operation,
+                memory_id,
+            )
+            if result_status == "synchronized":
+                self._record_memory_activity("save", "completed", 1)
+                self._record_memory_outcome("memory_saved_graph_synchronized")
+                return "synchronized"
+            if result_status == "memory_saved_relationships_untracked":
+                self._record_memory_activity("save", "partial", 1)
+                self._record_memory_outcome(
+                    "memory_saved_relationships_untracked"
+                )
+                return "untracked"
+            if result_status in {
+                "graph_synchronization_pending",
+                "replacement_cleanup_pending",
+                "memory_saved_relationships_pending",
+            }:
+                self._record_memory_activity("save", "partial", 1)
+                outcome = {
+                    "graph_synchronization_pending":
+                        "memory_saved_graph_pending",
+                    "replacement_cleanup_pending":
+                        "memory_replacement_cleanup_pending",
+                    "memory_saved_relationships_pending":
+                        "memory_saved_relationships_pending",
+                }[result_status]
+                self._record_memory_outcome(outcome)
+                return "partial"
+            self._record_memory_activity("save", "uncertain", 1)
+            self._record_memory_outcome("outcome_uncertain")
+            return "pending"
         return None
 
     def remember(self, message, response):
@@ -418,6 +1315,8 @@ User message:
 {message}
 """
 
+        started_at = time.perf_counter()
+        extraction_started = time.perf_counter()
         try:
             with timed_operation("Gemini memory extraction"):
                 extraction = self.client.models.generate_content(
@@ -435,6 +1334,10 @@ User message:
                 )
 
             response_text = extraction.text.strip()
+            self._record_response_timing(
+                "memory_extraction",
+                extraction_started,
+            )
 
             if not response_text:
                 print("[MEMORY] Gemini returned an empty response.")
@@ -451,12 +1354,37 @@ User message:
             
 
             if not memories:
+                self._record_memory_activity("save", "none")
                 return None
 
             stored_any = False
-
+            unique_memories = {}
             for memory in memories:
-                memory_text = memory.get("text", "").strip()
+                if not isinstance(memory, dict):
+                    continue
+                memory_text = memory.get("text", "")
+                if not isinstance(memory_text, str) or not memory_text.strip():
+                    continue
+                memory_text = memory_text.strip()
+                key = self._normalized_memory_text(memory_text)
+                if key not in unique_memories:
+                    unique_memories[key] = {
+                        **memory,
+                        "text": memory_text,
+                    }
+                    continue
+                existing = unique_memories[key]
+                existing["importance"] = max(
+                    existing.get("importance", 5),
+                    memory.get("importance", 5),
+                )
+                existing["confidence"] = max(
+                    existing.get("confidence", 0.5),
+                    memory.get("confidence", 0.5),
+                )
+
+            for memory in unique_memories.values():
+                memory_text = memory["text"]
                 importance = memory.get("importance", 5)
                 confidence = self._normalize_confidence(memory.get("confidence", 0.5))
                 reason = memory.get("reason", "not specified")
@@ -464,17 +1392,72 @@ User message:
                 if not memory_text:
                     continue
 
+                try:
+                    pending_result = self._reconcile_matching_memory_operation(
+                        memory_text,
+                    )
+                except Exception as error:
+                    pending_result = "pending"
+                    print(
+                        "[MEMORY] Existing uncertain write could not yet be "
+                        f"reconciled: {error}"
+                    )
+                if pending_result == "synchronized":
+                    self._record_memory_activity("save", "merged", 1)
+                    stored_any = True
+                    continue
+                if pending_result in {"pending", "untracked"}:
+                    self._record_memory_activity(
+                        "save",
+                        "partial" if pending_result == "untracked" else "uncertain",
+                        1,
+                    )
+                    if pending_result == "pending":
+                        self._record_memory_outcome("outcome_uncertain")
+                    stored_any = True
+                    continue
+
                 # Check whether this newly extracted memory duplicates
                 # an existing memory before storing it.
-                was_deduplicated = self.deduplicate_memory(
-                    memory_text,
-                    importance,
-                    reason, 
-                    confidence
-                )
+                deduplication_started = time.perf_counter()
+                try:
+                    was_deduplicated = self.deduplicate_memory(
+                        memory_text,
+                        importance,
+                        reason,
+                        confidence,
+                    )
+                finally:
+                    self._record_response_timing(
+                        "memory_deduplication",
+                        deduplication_started,
+                    )
 
-                if was_deduplicated:
-                    stored_any = True
+                if (
+                    was_deduplicated
+                    or getattr(self, "_last_deduplication_handled", False)
+                ):
+                    save_events = [
+                        event
+                        for event in self.last_response_metadata.get(
+                            "memory_activity",
+                            [],
+                        )
+                        if event["action"] == "save"
+                    ]
+                    if not save_events:
+                        self._record_memory_activity("save", "merged", 1)
+                        stored_any = True
+                    elif any(
+                        event["status"] in {
+                            "uncertain",
+                            "pending",
+                            "partial",
+                            "completed",
+                        }
+                        for event in save_events
+                    ):
+                        stored_any = True
                     continue
 
                 messages = [
@@ -484,73 +1467,32 @@ User message:
                     }
                 ]
 
-                add_result = self.memory.add(
+                write_result = self._write_memory_and_sync(
                     messages,
-                    self.user_id,
-                    metadata={
+                    memory_text,
+                    {
                         "importance": importance,
                         "confidence": confidence,
                         "reason": reason,
                         "source": "conversation"
-                    }
+                    },
                 )
 
-                if not isinstance(add_result, dict) or not add_result:
-                    print(
-                        "[MEMORY] Add returned no result; graph representation "
-                        "could not be confirmed."
-                    )
-                    continue
-
-                event_id = add_result.get("event_id")
-                if not isinstance(event_id, str) or not event_id.strip():
-                    print(
-                        "[MEMORY] Add returned no event ID; the memory may be "
-                        "stored, but graph representation is pending."
-                    )
+                if write_result["status"] in {
+                    "saved_graph_synced",
+                    "saved_graph_pending",
+                    "saved_relationships_pending",
+                    "saved_relationships_untracked",
+                    "outcome_uncertain",
+                    "succeeded_without_memory_id",
+                    "timeout",
+                }:
                     stored_any = True
-                    continue
-
-                graph_node_id = self.get_memory_id(event_id)
-                if not isinstance(graph_node_id, str) or not graph_node_id.strip():
-                    print(
-                        "[MEMORY] Mem0 accepted the memory, but its memory ID "
-                        "could not be confirmed; graph representation is pending."
-                    )
-                    stored_any = True
-                    continue
-
-                try:
-                    self.graph.add_node(
-                        self.user_id,
-                        graph_node_id,
-                        memory_text
-                    )
-                except Exception as e:
-                    print(
-                        f"[MEMORY] Mem0 memory {graph_node_id} was stored, but "
-                        f"graph node creation failed: {e}"
-                    )
-                    stored_any = True
-                    continue
-
-                if self.create_memory_relationships(graph_node_id, memory_text):
-                    print(
-                        f"[MEMORY] Mem0 memory {graph_node_id} and graph "
-                        "relationships were stored."
-                    )
-                else:
-                    print(
-                        f"[MEMORY] Mem0 memory {graph_node_id} and its graph "
-                        "node were stored, but relationship persistence failed; "
-                        "inspect /recover-relationships."
-                    )
-
-                stored_any = True
 
             return stored_any
 
         except Exception as e:
+            self._record_memory_activity("save", "failed")
             print(
                 f"\n[ERROR] Memory extraction/storage failed: {e}"
             )
@@ -561,6 +1503,8 @@ User message:
 
 
              return None
+        finally:
+            self._record_response_timing("memory_save", started_at)
 
     def create_memory_relationships(self, memory_id, memory_text):
         """
@@ -569,6 +1513,8 @@ User message:
         future reference.
         """
 
+        started_at = time.perf_counter()
+        self._last_relationship_status = "untracked"
         try:
             if not self.graph.create_relationship_recovery(
                 self.user_id,
@@ -595,16 +1541,25 @@ User message:
                 )
                 return False
 
-            return self._generate_tracked_relationships(
+            self._last_relationship_status = "pending"
+            relationships_synced = self._generate_tracked_relationships(
                 memory_id,
                 self.RELATIONSHIP_RECOVERY_ATTEMPT_LIMIT
             )
+            if relationships_synced:
+                self._last_relationship_status = "synchronized"
+            return relationships_synced
         except Exception as e:
             print(
                 f"[GRAPH] Relationship recovery tracking failed for "
                 f"{memory_id}; generation was not started: {e}"
             )
             return False
+        finally:
+            self._record_response_timing(
+                "gemini_relationship_generation",
+                started_at,
+            )
 
     def _generate_relationship_edges(self, memory_id):
         user_graph = self.graph.get_user_graph(self.user_id)
@@ -622,47 +1577,71 @@ User message:
         existing_nodes = [
             node
             for node in graph_nodes
-            if isinstance(node, dict) and node.get("id") != memory_id
-        ][:10]
+            if (
+                isinstance(node, dict)
+                and node.get("id") != memory_id
+                and isinstance(node.get("id"), str)
+                and node["id"].strip()
+                and isinstance(node.get("memory_text"), str)
+                and node["memory_text"].strip()
+            )
+        ]
 
         if not existing_nodes:
             return []
 
+        candidate_nodes = [source] + existing_nodes
         memory_list = "\n".join(
-            f"ID: {node['id']} | Memory: {node['memory_text']}"
-            for node in existing_nodes
+            f"MEM0_ID: {node['id']} | MEMORY: {node['memory_text']}"
+            for node in candidate_nodes
         )
 
         prompt = f"""
-    You are a knowledge graph relationship analyzer.
+    You are a conservative knowledge-graph relationship analyzer.
 
-    NEW MEMORY:
-    "{source['memory_text']}"
+    The supplied IDs are stable Mem0 memory IDs. Return them exactly;
+    never invent IDs or use display numbers.
 
-    EXISTING MEMORIES:
+    USER-PARTITION MEMORIES:
     {memory_list}
 
-    Determine whether the NEW MEMORY has a meaningful semantic
-    relationship with any EXISTING MEMORY.
+    Find only precise, directed relationships explicitly supported by
+    the memory text. Each relationship must be supported by evidence
+    quoted from BOTH endpoint memories. You may connect two existing
+    memories only when their direct relationship is stated by the
+    supplied records. Do not infer a relationship from a shared topic,
+    broad domain, model family, or mere co-occurrence.
 
     Rules:
-    - Use semantic understanding, not keyword matching.
-    - Same topic alone is NOT enough.
-    - Create a relationship only when the connection is meaningful.
-    - Do not invent information.
-    - One new memory may have zero, one, or multiple relationships.
-    - Prefer simple relationship names such as:
-    prefers, uses, works_with, related_to, plans,
-    studies, lives_in, interested_in, motivated_by
-    - If there is no meaningful relationship, return an empty list.
+    - Do not emit generic labels such as related_to, associated_with,
+      about, or connected_to.
+    - Use only these precise labels:
+      has_backend, uses_backend, has_milestone, has_deadline,
+      prerequisite_for, has_prerequisite, developed_on, runs_on,
+      uses, implements, reports_performance_of,
+      demonstrates_generalization_of, applies_to, part_of, member_of,
+      located_in, studies, prefers, interested_in, motivated_by,
+      describes, measured_on.
+    - Direction is semantic. For a prerequisite chain, point from the
+      prerequisite toward the dependent item and use prerequisite_for.
+    - Return zero edges if evidence does not support a precise relation.
+    - Include an exact quote from each endpoint. Evidence quotes must be
+      substrings of the corresponding memory text.
+    - Omit a relationship if either endpoint or either evidence quote is
+      uncertain.
 
     Return ONLY valid JSON:
 
     {{
         "relationships": [
             {{
-                "target_id": "existing-memory-id",
-                "relationship": "relationship_name"
+                "source_id": "source-mem0-id",
+                "target_id": "target-mem0-id",
+                "relationship": "precise_relationship_label",
+                "evidence": [
+                    {{"memory_id": "source-mem0-id", "quote": "exact source quote"}},
+                    {{"memory_id": "target-mem0-id", "quote": "exact target quote"}}
+                ]
             }}
         ]
     }}
@@ -692,34 +1671,65 @@ User message:
                 "Relationship response must contain a relationships list."
             )
 
-        valid_ids = {
-            node.get("id")
-            for node in existing_nodes
-            if isinstance(node.get("id"), str)
+        nodes_by_id = {
+            node["id"]: node["memory_text"]
+            for node in candidate_nodes
         }
         relationships = []
+        seen = set()
         for item in result["relationships"]:
             if not isinstance(item, dict):
                 raise ValueError("Relationship entries must be objects.")
 
+            source_id = item.get("source_id")
             target_id = item.get("target_id")
             relationship = item.get("relationship")
             if (
-                not isinstance(target_id, str)
+                not isinstance(source_id, str)
+                or source_id not in nodes_by_id
+                or not isinstance(target_id, str)
                 or not target_id.strip()
-                or target_id not in valid_ids
+                or target_id not in nodes_by_id
+                or source_id == target_id
                 or not isinstance(relationship, str)
-                or not relationship.strip()
+                or relationship not in self.RELATIONSHIP_LABELS
+                or not isinstance(item.get("evidence"), list)
+                or len(item["evidence"]) < 2
+                or len(item["evidence"]) > 5
             ):
                 raise ValueError(
                     "Relationship entry contains invalid endpoints or label."
                 )
+            evidence_ids = []
+            for evidence in item["evidence"]:
+                if (
+                    not isinstance(evidence, dict)
+                    or evidence.get("memory_id") not in nodes_by_id
+                    or not isinstance(evidence.get("quote"), str)
+                    or not evidence["quote"].strip()
+                    or len(evidence["quote"]) > 500
+                    or evidence["quote"]
+                    not in nodes_by_id[evidence["memory_id"]]
+                ):
+                    raise ValueError(
+                        "Relationship evidence must quote existing memory text."
+                    )
+                evidence_ids.append(evidence["memory_id"])
+            if source_id not in evidence_ids or target_id not in evidence_ids:
+                raise ValueError(
+                    "Relationship evidence must cite both endpoint memories."
+                )
+            identity = (source_id, target_id, relationship)
+            if identity in seen:
+                continue
+            seen.add(identity)
             edge = {
+                "source_id": source_id,
                 "target_id": target_id,
                 "relationship": relationship,
+                "evidence_ids": list(dict.fromkeys(evidence_ids)),
             }
-            if edge not in relationships:
-                relationships.append(edge)
+            relationships.append(edge)
 
         if len(relationships) > self.graph.MAX_EXPECTED_EDGES:
             raise ValueError("Relationship response exceeds the edge limit.")
@@ -1653,6 +2663,7 @@ User message:
         remain separate if they contain different information.
         """
 
+        self._last_deduplication_handled = False
         try:
             # Find potentially related memories using semantic search.
             similar_memories = self.recall(memory_text)
@@ -1961,6 +2972,7 @@ Format when there is no duplicate:
             ) else "conversation"
 
             # Create and confirm the replacement before deleting originals.
+            self._last_deduplication_handled = True
             messages = [
                 {
                     "role": "user",
@@ -1968,31 +2980,19 @@ Format when there is no duplicate:
                 }
             ]
 
-            add_result = self.memory.add(
+            write_result = self._write_memory_and_sync(
                 messages,
-                self.user_id,
-                metadata=merged_metadata
+                merged_memory,
+                merged_metadata,
+                operation_type="merge",
+                related_memory_ids=duplicate_ids,
+                create_relationships=False,
             )
 
-            if not isinstance(add_result, dict) or not add_result:
+            merged_memory_id = write_result.get("memory_id")
+            if write_result["status"] != "saved_graph_synced":
                 print(
-                    "[MEMORY] Merged-memory creation returned no result; "
-                    "original memories were preserved."
-                )
-                return False
-
-            event_id = add_result.get("event_id")
-            if not isinstance(event_id, str) or not event_id.strip():
-                print(
-                    "[MEMORY] Merged-memory creation returned no event ID; "
-                    "original memories were preserved."
-                )
-                return False
-
-            merged_memory_id = self.get_memory_id(event_id)
-            if not isinstance(merged_memory_id, str) or not merged_memory_id.strip():
-                print(
-                    "[MEMORY] Could not confirm the merged memory ID; "
+                    "[MEMORY] Merged memory was not fully synchronized; "
                     "original memories were preserved."
                 )
                 return False
@@ -2018,6 +3018,7 @@ Format when there is no duplicate:
                     )
 
             graph_errors = []
+            graph_started = time.perf_counter()
             for duplicate_id in deleted_ids:
                 try:
                     self.graph.delete_node(
@@ -2026,13 +3027,26 @@ Format when there is no duplicate:
                     )
                 except Exception as e:
                     graph_errors.append(str(e))
+            self._record_response_timing(
+                "graph_persistence",
+                graph_started,
+            )
 
+            graph_started = time.perf_counter()
             try:
                 self.graph.add_node(
                     self.user_id,
                     merged_memory_id,
                     merged_memory
                 )
+            except Exception as e:
+                graph_errors.append(str(e))
+            finally:
+                self._record_response_timing(
+                    "graph_persistence",
+                    graph_started,
+                )
+            try:
                 if not self.create_memory_relationships(
                     merged_memory_id,
                     merged_memory
@@ -2073,17 +3087,33 @@ Format when there is no duplicate:
         Search the user's long-term memories.
         """
 
+        started_at = time.perf_counter()
         try:
-            return self.memory.search(
+            results = self.memory.search(
                 query,
                 self.user_id
             )
+            memories = (
+                results.get("results", [])
+                if isinstance(results, dict)
+                and isinstance(results.get("results"), list)
+                else []
+            )
+            self._record_memory_activity(
+                "retrieval",
+                "completed" if memories else "none",
+                len(memories),
+            )
+            return results
 
         except Exception as e:
+            self._record_memory_activity("retrieval", "failed")
             print(
                 f"\n[ERROR] Memory search failed: {e}\n"
             )
-            return {"results": []}
+            raise
+        finally:
+            self._record_response_timing("memory_retrieval", started_at)
 
     def update_memory(self, message, candidate_memories):
         """
@@ -2093,9 +3123,11 @@ Format when there is no duplicate:
         This runs on every user message. It does not depend on keywords.
         """
 
+        self._last_update_handled = False
         if not candidate_memories:
             return False
 
+        started_at = time.perf_counter()
         try:
             memory_list = "\n".join(
                 f"ID: {memory['id']} | Memory: {memory['memory']}"
@@ -2269,6 +3301,33 @@ If there are no updates, return:
                     continue
 
                 try:
+                    pending_result = (
+                        self._reconcile_matching_memory_operation(
+                            memory_text,
+                            operation_types={"update"},
+                        )
+                    )
+                    if pending_result is not None:
+                        self._last_update_handled = True
+                        update_status = {
+                            "synchronized": "completed",
+                            "partial": "partial",
+                            "untracked": "partial",
+                            "pending": "uncertain",
+                        }[pending_result]
+                        self._record_memory_activity(
+                            "update",
+                            update_status,
+                            1,
+                        )
+                        if pending_result in {
+                            "synchronized",
+                            "partial",
+                            "untracked",
+                        }:
+                            updated_any = True
+                        continue
+
                     print(f"[MEMORY] Updating memory: {memory_id}")
 
                     messages = [
@@ -2323,10 +3382,10 @@ If there are no updates, return:
                         }
                     )
 
-                    new_add_result = self.memory.add(
+                    write_result = self._write_memory_and_sync(
                         messages,
-                        self.user_id,
-                        metadata={
+                        memory_text,
+                        {
                             **old_metadata,
                             "importance": importance,
                             "confidence": confidence,
@@ -2336,29 +3395,42 @@ If there are no updates, return:
                                 **evolution_metadata,
                                 "history": history
                             }),
-                        }
+                        },
+                        operation_type="update",
+                        related_memory_ids=[memory_id],
+                        create_relationships=False,
                     )
 
-                    if not isinstance(new_add_result, dict) or not new_add_result:
-                        print(
-                            f"[MEMORY] Replacement creation returned no result "
-                            f"for {memory_id}; original memory was preserved."
+                    new_memory_id = write_result.get("memory_id")
+                    self._last_update_handled = True
+                    if write_result["status"] != "saved_graph_synced":
+                        updated_any = write_result["status"] in {
+                            "saved_graph_pending",
+                            "saved_relationships_pending",
+                        }
+                        self._record_memory_activity(
+                            "update",
+                            (
+                                "uncertain"
+                                if write_result["status"] in {
+                                    "outcome_uncertain",
+                                    "timeout",
+                                    "succeeded_without_memory_id",
+                                }
+                                else "partial"
+                                if write_result["status"] in {
+                                    "saved_graph_pending",
+                                    "saved_relationships_pending",
+                                }
+                                else "failed"
+                            ),
+                            1,
                         )
-                        continue
-
-                    event_id = new_add_result.get("event_id")
-                    if not isinstance(event_id, str) or not event_id.strip():
                         print(
-                            f"[MEMORY] Replacement creation returned no event ID "
-                            f"for {memory_id}; original memory was preserved."
-                        )
-                        continue
-
-                    new_memory_id = self.get_memory_id(event_id)
-                    if not isinstance(new_memory_id, str) or not new_memory_id.strip():
-                        print(
-                            f"[MEMORY] Could not confirm the replacement ID for "
-                            f"{memory_id}; original memory was preserved."
+                            "[MEMORY] Memory update partially completed; "
+                            "replacement was not fully "
+                            "synchronized; the original memory was "
+                            "preserved and reconciliation is required."
                         )
                         continue
 
@@ -2380,6 +3452,7 @@ If there are no updates, return:
                     graph_errors = []
                     recovery_warnings = []
                     graph_reconciled = False
+                    graph_started = time.perf_counter()
                     if deletion_confirmed:
                         try:
                             reconciliation = self.graph.reconcile_memory_replacement(
@@ -2411,6 +3484,10 @@ If there are no updates, return:
                             graph_reconciled = True
                         except Exception as e:
                             graph_errors.append(str(e))
+                    self._record_response_timing(
+                        "graph_persistence",
+                        graph_started,
+                    )
 
                     if graph_reconciled:
                         try:
@@ -2427,8 +3504,18 @@ If there are no updates, return:
                         and not graph_errors
                         and not recovery_warnings
                     ):
+                        self._record_memory_activity(
+                            "update",
+                            "completed",
+                            1,
+                        )
                         print("[MEMORY] Memory updated successfully.")
                     else:
+                        self._record_memory_activity(
+                            "update",
+                            "partial",
+                            1,
+                        )
                         print(
                             f"[MEMORY] Memory update partially completed. "
                             f"Replacement ID: {new_memory_id}; "
@@ -2442,6 +3529,7 @@ If there are no updates, return:
                     updated_any = True
 
                 except Exception as e:
+                    self._record_memory_activity("update", "failed")
                     print(
                         f"\n[ERROR] Could not update memory {memory_id}: {e}\n"
                     )
@@ -2457,6 +3545,8 @@ If there are no updates, return:
 
 
              return False
+        finally:
+            self._record_response_timing("memory_update", started_at)
 
     def decide_memory(self, message):
         """
@@ -2598,6 +3688,7 @@ User message:
 "{message}"
 """
 
+        started_at = time.perf_counter()
         try:
             with timed_operation("Gemini memory decision"):
                 response = self.client.models.generate_content(
@@ -2621,20 +3712,37 @@ User message:
 
             result = json.loads(response_text)
 
-            return result.get(
-                "should_remember",
-                False
-            )
+            decision = result.get("should_remember")
+            if isinstance(decision, bool):
+                self._record_memory_activity(
+                    "decision",
+                    "completed" if decision else "none",
+                )
+            else:
+                self._record_memory_activity("decision", "failed")
+                return False
+            return decision
 
         except Exception as e:
+            self._record_memory_activity("decision", "failed")
             print(
                 f"\n[ERROR] Gemini memory decision failed: {e}\n"
             )
             return False
+        finally:
+            self._record_response_timing("memory_decision", started_at)
 
     def respond(self, message):
-        with timed_operation("User-message handling"):
-            return self._respond(message)
+        self.last_response_metadata = {
+            "memory_activity": [],
+            "timings_ms": {},
+        }
+        started_at = time.perf_counter()
+        try:
+            with timed_operation("User-message handling"):
+                return self._respond(message)
+        finally:
+            self._record_response_timing("agent_execution", started_at)
 
     def _respond(self, message):
         """
@@ -2666,13 +3774,23 @@ User message:
         # If semantic search does not return a strong enough candidate,
         # fall back to the user's stored memories so Gemini can resolve
         # short contextual updates such as "move it to 12".
-        if not candidate_memories:
+        if (
+            not candidate_memories
+            and self._needs_memory_fallback(message)
+        ):
             try:
+                memory_list_started_at = time.perf_counter()
                 all_memories = self.memory.get_all(self.user_id)
                 if all_memories and "results" in all_memories:
                     candidate_memories = all_memories["results"][:10]
             except Exception as e:
+                self._record_memory_activity("update", "failed")
                 print(f"[ERROR] Could not load memories for update analysis: {e}")
+            finally:
+                self._record_response_timing(
+                    "memory_fallback_list",
+                    memory_list_started_at,
+                )
 
         # Historical memories should not be updated again.
         # If a candidate is referenced by another candidate's
@@ -2692,7 +3810,26 @@ User message:
             if item.get("id") not in historical_ids
         ]
 
+        existing_update_events = sum(
+            event["action"] == "update"
+            for event in self.last_response_metadata["memory_activity"]
+        )
         was_updated = self.update_memory(message, candidate_memories)
+        update_handled = was_updated or getattr(
+            self,
+            "_last_update_handled",
+            False,
+        )
+        updated_event_count = sum(
+            event["action"] == "update"
+            for event in self.last_response_metadata["memory_activity"]
+        )
+        if updated_event_count == existing_update_events:
+            self._record_memory_activity(
+                "update",
+                "completed" if was_updated else "none",
+                1 if was_updated else None,
+            )
 
         # If a memory changed, retrieve again so the response uses the
         # newly stored version instead of the outdated one.
@@ -2847,18 +3984,25 @@ Do not invent information.
 Answer naturally.
 """
 
-        with timed_operation("Gemini response generation"):
-            response = self.client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=system_prompt,
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
+        response_started_at = time.perf_counter()
+        try:
+            with timed_operation("Gemini response generation"):
+                response = self.client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=system_prompt,
+                    config=types.GenerateContentConfig(
+                        thinking_config=types.ThinkingConfig(
+                            thinking_level="minimal"
+                        ),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        )
                     )
                 )
+        finally:
+            self._record_response_timing(
+                "gemini_response",
+                response_started_at,
             )
 
 
@@ -2874,13 +4018,17 @@ Answer naturally.
         # update an existing memory. Updated memories have already been
         # replaced by update_memory().
         should_remember = (
-            False if was_updated else self.decide_memory(message)
+            False if update_handled else self.decide_memory(message)
         )
-
         print(f"[DEBUG] Should remember: {should_remember}")
 
 
-        if not was_updated and should_remember:
+        if not update_handled and should_remember:
             self.remember(message, answer)
+        elif not update_handled and not any(
+            event["action"] == "save"
+            for event in self.last_response_metadata["memory_activity"]
+        ):
+            self._record_memory_activity("save", "none")
 
         return answer

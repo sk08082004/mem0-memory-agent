@@ -1,5 +1,8 @@
+import copy
+import hashlib
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,9 +20,31 @@ from app.dashboard_data import (
     load_dashboard_snapshot,
     paginate,
 )
+from app.conversation import (
+    GENERIC_AGENT_ERROR,
+    MEMORY_OUTCOME_LABELS,
+    process_conversation_command,
+    process_conversation_message,
+    start_new_conversation,
+)
+from app.commands import command_requires_agent, dispatch_chat_command
+from app.conversation_store import (
+    ConversationStoreError,
+    JsonConversationRepository,
+)
 
 
 GRAPH_FILE = "graph.json"
+DASHBOARD_SECTIONS = (
+    "Conversation",
+    "Overview",
+    "Memory explorer",
+    "Knowledge graph",
+    "Recovery centre",
+    "Data integrity",
+    "Performance and diagnostics",
+)
+DEFAULT_DASHBOARD_SECTION = "Conversation"
 RECOVERY_STATUSES = (
     "pending_generation",
     "pending_persistence",
@@ -1057,6 +1082,607 @@ def _render_diagnostics(st, snapshot):
     )
 
 
+def _conversation_agent(st, user_id, conversation):
+    agents = st.session_state.get("dashboard_agents")
+    if not isinstance(agents, dict):
+        agents = {}
+    user_agents = agents.get(user_id)
+    if not isinstance(user_agents, dict):
+        user_agents = {}
+    agent = user_agents.get(conversation["id"])
+    if agent is None:
+        from app.main import create_agent
+
+        agent = create_agent(user_id)
+        recent_messages = [
+            item
+            for item in conversation["messages"]
+            if (
+                item.get("status", "success") == "success"
+                and item.get("message_type") != "command"
+            )
+        ][-agent.max_history:]
+        agent.conversation_history = [
+            {"role": item["role"], "text": item["content"]}
+            for item in recent_messages
+        ]
+        user_agents[conversation["id"]] = agent
+        agents[user_id] = user_agents
+        st.session_state["dashboard_agents"] = agents
+    return agent
+
+
+def _conversation_timestamp(conversation):
+    if conversation["messages"]:
+        return conversation["messages"][-1].get(
+            "timestamp",
+            conversation["created_at"],
+        )
+    return conversation["created_at"]
+
+
+def _render_memory_activity(st, message, identity_key):
+    activity = message.get("memory_activity", [])
+    if not activity:
+        return
+    labels = {
+        ("retrieval", "completed"): "Relevant memories retrieved",
+        ("retrieval", "none"): "No relevant memories returned",
+        ("retrieval", "failed"): "Memory retrieval failed",
+        ("update", "completed"): "An existing memory was updated",
+        ("update", "partial"): "Memory update partially completed",
+        ("update", "uncertain"): "Memory update outcome is uncertain; reconciliation is required",
+        ("update", "failed"): "Memory update failed",
+        ("update", "none"): "No existing memory was updated",
+        ("save", "completed"): "A memory was saved",
+        ("save", "merged"): "Duplicate memories were merged",
+        ("save", "partial"): "Memory saving was partially confirmed",
+        ("save", "pending"): "Mem0 reported success, but no memory ID was confirmed; graph sync is pending",
+        ("save", "uncertain"): "Memory outcome is uncertain; reconciliation is required and no duplicate write was made",
+        ("save", "failed"): "Memory saving failed",
+        ("save", "none"): "No long-term memory change was made",
+        ("decision", "completed"): "The agent identified information to remember",
+        ("decision", "none"): "The agent found no new long-term fact to remember",
+        ("decision", "failed"): "The memory decision could not be completed",
+    }
+    with st.expander("Memory activity"):
+        for item in activity:
+            label = labels.get(
+                (item.get("action"), item.get("status")),
+                "Memory activity could not be summarized",
+            )
+            count = item.get("count")
+            if isinstance(count, int) and count > 0:
+                label += f" · {count}"
+            st.caption(label)
+        memory_writes = message.get("memory_writes")
+        if isinstance(memory_writes, int):
+            st.caption(f"Mem0 writes: {memory_writes}")
+        for outcome in message.get("memory_outcomes", []):
+            label = MEMORY_OUTCOME_LABELS.get(outcome)
+            if label:
+                st.warning(label)
+        polling = message.get("polling")
+        if isinstance(polling, dict):
+            st.caption(
+                f"Mem0 event polling: {polling.get('attempts', 0)} attempts; "
+                f"{polling.get('sleep_ms', 0.0):.0f} ms total wait."
+            )
+        if st.button(
+            "Open memory explorer",
+            key=f"conversation_memory_explorer_{identity_key}",
+            icon=":material/search:",
+        ):
+            st.session_state["dashboard_navigation_target"] = (
+                "Memory explorer"
+            )
+            st.rerun()
+
+
+def _render_conversation_message(
+    st,
+    message,
+    identity_key,
+    on_confirm_clear=None,
+):
+    with st.chat_message(message["role"]):
+        if (
+            message["role"] == "assistant"
+            and message.get("message_type") == "command"
+        ):
+            command_status = message.get("command_status", "success")
+            st.caption(
+                "Command response · "
+                + (
+                    message.get("command_name", "command")
+                    if message.get("command_name") == "exit"
+                    else f"/{message.get('command_name', 'command')}"
+                )
+            )
+            if command_status == "error":
+                st.error(message["content"])
+            elif message.get("command_format") == "code":
+                st.code(message["content"], language="json")
+            elif message.get("command_format") == "markdown":
+                st.markdown(message["content"])
+            elif command_status == "confirmation":
+                st.info(message["content"])
+            else:
+                st.markdown(message["content"])
+            if (
+                message.get("command_action") == "confirm_clear"
+                and on_confirm_clear is not None
+                and st.button(
+                    "Confirm clear all memories",
+                    key=f"confirm_clear_{identity_key}",
+                    type="secondary",
+                    icon=":material/delete:",
+                )
+            ):
+                on_confirm_clear(message)
+        else:
+            st.markdown(message["content"])
+        st.caption(_format_timestamp(message["timestamp"]))
+        if (
+            message["role"] == "assistant"
+            and message.get("message_type") != "command"
+        ):
+            latency_ms = message.get("latency_ms")
+            if isinstance(latency_ms, (int, float)):
+                st.caption(f"Agent response: {latency_ms:.0f} ms")
+            _render_memory_activity(st, message, identity_key)
+        elif message.get("status") == "failed":
+            st.error(
+                message.get("display_error", GENERIC_AGENT_ERROR),
+                title="This message was not completed",
+            )
+            technical_error = message.get("error")
+            if technical_error:
+                with st.expander("Technical details"):
+                    st.caption(technical_error)
+            _render_memory_activity(st, message, identity_key)
+
+
+def _recent_conversations(conversations, query):
+    normalized_query = query.casefold().strip()
+    results = [
+        item
+        for item in conversations
+        if not normalized_query
+        or normalized_query in item["title"].casefold()
+        or any(
+            normalized_query in message["content"].casefold()
+            for message in item["messages"]
+        )
+    ]
+    return sorted(
+        results,
+        key=_conversation_timestamp,
+        reverse=True,
+    )
+
+
+def _merge_unsaved_conversations(st, user_id, user_data, repository, readable):
+    unsaved_by_user = st.session_state.get(
+        "dashboard_unsaved_conversations",
+        {},
+    )
+    if not isinstance(unsaved_by_user, dict):
+        unsaved_by_user = {}
+    user_unsaved = unsaved_by_user.get(user_id, {})
+    if not isinstance(user_unsaved, dict):
+        user_unsaved = {}
+
+    save_error = None
+    for conversation_id, unsaved in list(user_unsaved.items()):
+        conversation = copy.deepcopy(unsaved)
+        if readable:
+            try:
+                conversation = repository.save_conversation(
+                    user_id,
+                    conversation,
+                )
+            except (ConversationStoreError, ValueError) as error:
+                save_error = error
+            else:
+                user_unsaved.pop(conversation_id, None)
+
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(user_data["conversations"])
+                if item["id"] == conversation_id
+            ),
+            None,
+        )
+        if existing_index is None:
+            user_data["conversations"].append(conversation)
+        else:
+            user_data["conversations"][existing_index] = conversation
+        user_data["active_id"] = conversation_id
+
+    if user_unsaved:
+        unsaved_by_user[user_id] = user_unsaved
+    else:
+        unsaved_by_user.pop(user_id, None)
+    st.session_state["dashboard_unsaved_conversations"] = unsaved_by_user
+    return user_data, save_error
+
+
+def _stash_unsaved_conversation(st, user_id, conversation):
+    unsaved_by_user = st.session_state.get(
+        "dashboard_unsaved_conversations",
+        {},
+    )
+    if not isinstance(unsaved_by_user, dict):
+        unsaved_by_user = {}
+    user_unsaved = unsaved_by_user.setdefault(user_id, {})
+    if not isinstance(user_unsaved, dict):
+        user_unsaved = {}
+        unsaved_by_user[user_id] = user_unsaved
+    user_unsaved[conversation["id"]] = copy.deepcopy(conversation)
+    st.session_state["dashboard_unsaved_conversations"] = unsaved_by_user
+
+
+def _forget_unsaved_conversation(st, user_id, conversation_id):
+    unsaved_by_user = st.session_state.get(
+        "dashboard_unsaved_conversations",
+        {},
+    )
+    user_unsaved = (
+        unsaved_by_user.get(user_id)
+        if isinstance(unsaved_by_user, dict)
+        else None
+    )
+    if isinstance(user_unsaved, dict):
+        user_unsaved.pop(conversation_id, None)
+        if not user_unsaved:
+            unsaved_by_user.pop(user_id, None)
+        st.session_state["dashboard_unsaved_conversations"] = unsaved_by_user
+
+
+def _render_conversation(st, user_id, repository, user_data):
+    st.title("Mem0")
+    st.caption(
+        "A private, local assistant with long-term memory"
+    )
+    if not user_id:
+        st.info(
+            "Choose your local user ID in workspace settings to start chatting.",
+            title="Select a conversation scope",
+        )
+        return
+
+    identity_key = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
+    conversations = user_data["conversations"]
+    if user_data.get("active_id") is None and conversations:
+        user_data["active_id"] = conversations[-1]["id"]
+    conversation = next(
+        (
+            item
+            for item in conversations
+            if item["id"] == user_data.get("active_id")
+        ),
+        None,
+    )
+
+    if conversation and conversation["messages"]:
+        for message_index, message in enumerate(conversation["messages"]):
+            def confirm_clear(command_message):
+                command_message.pop("command_action", None)
+                command_message["command_status"] = "success"
+                try:
+                    agent = _conversation_agent(st, user_id, conversation)
+                    result = dispatch_chat_command(
+                        agent,
+                        "/clear",
+                        confirm_clear=True,
+                        user_id=user_id,
+                    )
+                except Exception as error:
+                    result = {
+                        "text": f"Could not clear memories: {error}",
+                        "status": "error",
+                        "format": "text",
+                    }
+                command_message["content"] = result["text"]
+                command_message["command_status"] = result["status"]
+                command_message["command_format"] = result["format"]
+                try:
+                    repository.save_conversation(user_id, conversation)
+                except (ConversationStoreError, ValueError) as error:
+                    _stash_unsaved_conversation(st, user_id, conversation)
+                    st.error(
+                        f"Command result could not be saved: {error}",
+                        title="History was not saved",
+                    )
+                st.rerun()
+
+            _render_conversation_message(
+                st,
+                message,
+                f"{identity_key}_{conversation['id']}_{message_index}",
+                on_confirm_clear=confirm_clear,
+            )
+    else:
+        st.markdown("### What would you like to explore?")
+        st.write(
+            "Ask a question, pick up a project, or share useful context. "
+            "The agent decides whether anything belongs in long-term memory."
+        )
+        examples = (
+            ("What do you remember about my current projects?", "memory"),
+            ("Help me think through a decision.", "decision"),
+            ("What should I focus on today?", "focus"),
+        )
+        columns = st.columns(len(examples))
+        for column, (example, suffix) in zip(columns, examples):
+            if column.button(
+                example,
+                key=f"conversation_example_{identity_key}_{suffix}",
+                width="stretch",
+            ):
+                st.session_state["conversation_example_prompt"] = example
+                st.rerun()
+
+    if conversation:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.subheader(conversation["title"])
+            with st.popover(
+                "Conversation options",
+            ):
+                with st.form(f"rename_conversation_{conversation['id']}"):
+                    new_title = st.text_input(
+                        "Rename conversation",
+                        value=conversation["title"],
+                        max_chars=80,
+                    )
+                    rename_submitted = st.form_submit_button(
+                        "Save title",
+                        icon=":material/edit:",
+                    )
+                if rename_submitted:
+                    try:
+                        repository.rename_conversation(
+                            user_id,
+                            conversation["id"],
+                            new_title,
+                        )
+                    except (ValueError, ConversationStoreError) as error:
+                        st.error(str(error), title="Could not rename")
+                    else:
+                        _forget_unsaved_conversation(
+                            st,
+                            user_id,
+                            conversation["id"],
+                        )
+                        st.rerun()
+                with st.form(f"delete_conversation_{conversation['id']}"):
+                    confirmed = st.checkbox(
+                        "I understand this removes only the transcript."
+                    )
+                    delete_submitted = st.form_submit_button(
+                        "Delete conversation",
+                        type="secondary",
+                        icon=":material/delete:",
+                    )
+                if delete_submitted:
+                    if not confirmed:
+                        st.error(
+                            "Confirm transcript deletion using the checkbox."
+                        )
+                    else:
+                        try:
+                            repository.delete_conversation(
+                                user_id,
+                                conversation["id"],
+                            )
+                        except (ValueError, ConversationStoreError) as error:
+                            st.error(
+                                str(error),
+                                title="Could not delete conversation",
+                            )
+                        else:
+                            _forget_unsaved_conversation(
+                                st,
+                                user_id,
+                                conversation["id"],
+                            )
+                            st.session_state.pop("dashboard_agents", None)
+                            st.rerun()
+
+    if conversation and conversation["messages"]:
+        st.divider()
+        with st.expander("Agent performance details"):
+            latest_assistant = next(
+                (
+                    item
+                    for item in reversed(conversation["messages"])
+                    if (
+                        item["role"] == "assistant"
+                        and item.get("message_type") != "command"
+                    )
+                ),
+                None,
+            )
+            timings = (
+                latest_assistant.get("timings_ms", {})
+                if latest_assistant
+                else {}
+            )
+            if timings:
+                st.dataframe(
+                    [
+                        {
+                            "Operation": name.replace("_", " ").capitalize(),
+                            "Time (ms)": round(duration, 1),
+                        }
+                        for name, duration in timings.items()
+                    ],
+                    hide_index=True,
+                    alt="Measured timings for recent agent stages",
+                )
+            else:
+                st.caption("No stage timing data is available.")
+
+    example_prompt = st.session_state.pop(
+        "conversation_example_prompt",
+        None,
+    )
+    prompt = st.chat_input(
+        "Message your memory agent",
+        key=f"dashboard_chat_input_{identity_key}",
+        submit_mode="disable",
+    )
+    prompt = prompt or example_prompt
+    if prompt:
+        if conversation is None:
+            try:
+                conversation, user_data = repository.create_conversation(
+                    user_id
+                )
+            except ConversationStoreError as error:
+                conversation = start_new_conversation(
+                    user_data,
+                    user_id,
+                )
+                st.warning(
+                    "Local history is unavailable. Your message will remain "
+                    "visible in this browser session, but cannot be saved "
+                    "until local storage is available.",
+                    title="Conversation is not saved",
+                )
+                with st.expander("Technical details"):
+                    st.caption(str(error))
+            st.session_state["dashboard_agents"] = {}
+        identity_key = f"{identity_key}_{conversation['id']}"
+        pending_submission = st.session_state.get(
+            "dashboard_pending_submission"
+        )
+        if (
+            not isinstance(pending_submission, dict)
+            or pending_submission.get("user_id") != user_id
+            or pending_submission.get("conversation_id") != conversation["id"]
+            or pending_submission.get("prompt") != prompt
+        ):
+            pending_submission = {
+                "user_id": user_id,
+                "conversation_id": conversation["id"],
+                "prompt": prompt,
+                "id": uuid.uuid4().hex,
+            }
+            st.session_state["dashboard_pending_submission"] = (
+                pending_submission
+            )
+        submission_id = pending_submission["id"]
+        already_processed = any(
+            message.get("submission_id") == submission_id
+            for message in conversation["messages"]
+        )
+        if already_processed:
+            st.session_state.pop("dashboard_pending_submission", None)
+            st.rerun()
+        if prompt.lstrip().startswith("/") or prompt.strip().casefold() == "exit":
+            try:
+                agent = (
+                    _conversation_agent(st, user_id, conversation)
+                    if command_requires_agent(prompt)
+                    else None
+                )
+                command_result = dispatch_chat_command(
+                    agent,
+                    prompt,
+                    user_id=user_id,
+                )
+            except Exception as error:
+                command_result = {
+                    "handled": True,
+                    "command": "command",
+                    "status": "error",
+                    "text": f"Could not run command: {error}",
+                    "format": "text",
+                }
+        else:
+            command_result = None
+        if command_result is not None:
+            result = process_conversation_command(
+                conversation,
+                user_id,
+                prompt,
+                command_result,
+                submission_id=submission_id,
+                persist=lambda updated: repository.save_conversation(
+                    user_id,
+                    updated,
+                ),
+            )
+            if result.get("persistence_failed"):
+                _stash_unsaved_conversation(st, user_id, conversation)
+            action = command_result.get("action") or {}
+            if result.get("success") and action.get("type") == "new_conversation":
+                repository.create_conversation(user_id)
+            elif result.get("success") and action.get("type") == "login":
+                st.session_state["dashboard_user_id"] = action["user_id"]
+            elif result.get("success") and action.get("type") == "logout":
+                st.session_state["dashboard_command_notice"] = (
+                    command_result["text"]
+                )
+                st.session_state["dashboard_user_id"] = ""
+                st.session_state.pop("dashboard_agents", None)
+        else:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    result = process_conversation_message(
+                        conversation,
+                        user_id,
+                        prompt,
+                        lambda: _conversation_agent(
+                            st,
+                            user_id,
+                            conversation,
+                        ),
+                        submission_id=submission_id,
+                        persist=lambda updated: repository.save_conversation(
+                            user_id,
+                            updated,
+                        ),
+                    )
+                    if result.get("persistence_failed"):
+                        _stash_unsaved_conversation(
+                            st,
+                            user_id,
+                            conversation,
+                        )
+                    if result.get("success"):
+                        st.markdown(result["response"])
+                    elif result.get("persistence_failed") and result.get("response"):
+                        st.markdown(result["response"])
+                        st.warning(
+                            "The answer was generated but could not be saved to "
+                            "local history. It may not be available after restart.",
+                            title="History was not saved",
+                        )
+                    else:
+                        st.error(
+                            result.get("error", GENERIC_AGENT_ERROR),
+                            title="Could not complete this message",
+                        )
+                        if result.get("technical_error"):
+                            with st.expander("Technical details"):
+                                st.caption(result["technical_error"])
+            if conversation["messages"]:
+                last = conversation["messages"][-1]
+                _render_memory_activity(
+                    st,
+                    last,
+                    f"{identity_key}_{conversation['id']}_latest",
+                )
+        st.session_state.pop("dashboard_pending_submission", None)
+        st.rerun()
+
+
 def main():
     import streamlit as st
 
@@ -1067,50 +1693,206 @@ def main():
         initial_sidebar_state="expanded",
     )
 
+    if "dashboard_user_id" not in st.session_state:
+        from app.main import load_user
+
+        st.session_state["dashboard_user_id"] = load_user() or ""
+    navigation_target = st.session_state.pop(
+        "dashboard_navigation_target",
+        None,
+    )
+    if navigation_target in DASHBOARD_SECTIONS:
+        st.session_state["dashboard_section"] = navigation_target
+
     @st.cache_data(ttl=30, max_entries=16, show_spinner=False)
     def cached_snapshot(graph_path, modified_ns, file_size, user_id):
         del modified_ns, file_size
         return load_dashboard_snapshot(graph_path, user_id)
 
-    with st.sidebar:
-        st.title("Memory operations dashboard")
-        st.caption("Read-only graph and recovery observability")
-        with st.form("dashboard_scope"):
-            user_id = st.text_input(
-                "Local user ID",
-                value=st.session_state.get("dashboard_user_id", ""),
-                help="Selects a user-scoped graph snapshot; it is not "
-                     "an authentication mechanism.",
-            )
-            graph_path = st.text_input(
-                "Graph file",
-                value=st.session_state.get("dashboard_graph_path", GRAPH_FILE),
-            )
-            refresh = st.form_submit_button(
-                "Load or refresh snapshot",
-                type="primary",
-                icon=":material/refresh:",
-                width="stretch",
-            )
-        if refresh:
-            st.session_state["dashboard_user_id"] = user_id.strip()
-            st.session_state["dashboard_graph_path"] = graph_path.strip()
-            cached_snapshot.clear()
-        st.warning(
-            "Local operator view only. A user ID selects data but does not "
-            "prove authorization. Do not expose this app publicly until "
-            "authentication and tenant authorization are implemented.",
-            icon=":material/lock:",
-        )
-        st.caption(
-            "The dashboard never writes graph/session files or runs recovery."
-        )
-
     active_user = st.session_state.get("dashboard_user_id", "")
+    repository = JsonConversationRepository()
+    user_data = {"active_id": None, "conversations": []}
+    malformed_history = False
+    conversation_store_error = None
+    if active_user:
+        try:
+            user_data, malformed_history = repository.load_user(active_user)
+        except ConversationStoreError as error:
+            conversation_store_error = error
+        user_data, unsaved_history_error = _merge_unsaved_conversations(
+            st,
+            active_user,
+            user_data,
+            repository,
+            readable=conversation_store_error is None,
+        )
+    else:
+        unsaved_history_error = None
+
     active_graph_path = st.session_state.get(
         "dashboard_graph_path",
         GRAPH_FILE,
     )
+    with st.sidebar:
+        st.title("Mem0")
+        st.caption("Personal memory assistant")
+        section = st.selectbox(
+            "Workspace",
+            DASHBOARD_SECTIONS,
+            index=DASHBOARD_SECTIONS.index(
+                st.session_state.get(
+                    "dashboard_section",
+                    DEFAULT_DASHBOARD_SECTION,
+                )
+            ) if st.session_state.get(
+                "dashboard_section",
+                DEFAULT_DASHBOARD_SECTION,
+            ) in DASHBOARD_SECTIONS else 0,
+            key="dashboard_section",
+        )
+        if section == "Conversation":
+            if st.button(
+                "New conversation",
+                icon=":material/add:",
+                type="primary",
+                width="stretch",
+                key="dashboard_new_conversation",
+            ):
+                if not active_user:
+                    st.warning("Choose a local user in workspace settings first.")
+                else:
+                    try:
+                        repository.create_conversation(active_user)
+                    except ConversationStoreError as error:
+                        st.error(
+                            str(error),
+                            title="Could not create conversation",
+                        )
+                    else:
+                        st.rerun()
+
+            st.caption("Recent conversations")
+            search = st.text_input(
+                "Search conversations",
+                placeholder="Search titles and messages",
+                label_visibility="collapsed",
+                key="conversation_search",
+                disabled=not active_user,
+            )
+            recent = _recent_conversations(
+                user_data["conversations"],
+                search,
+            )
+            if not active_user:
+                st.caption("Select a local user to see conversation history.")
+            elif conversation_store_error:
+                st.error(
+                    "Local conversation history is unavailable. "
+                    "Your existing file has not been changed.",
+                    title="History could not be loaded",
+                )
+            elif not recent:
+                st.caption(
+                    "No matching conversations yet. Start a new one to begin."
+                )
+            else:
+                for recent_conversation in recent[:30]:
+                    active_marker = (
+                        ":material/chat_bubble: "
+                        if recent_conversation["id"] == user_data["active_id"]
+                        else ""
+                    )
+                    if st.button(
+                        active_marker + recent_conversation["title"],
+                        key=(
+                            "recent_conversation_"
+                            f"{active_user}_{recent_conversation['id']}"
+                        ),
+                        width="stretch",
+                        help=_format_timestamp(
+                            _conversation_timestamp(recent_conversation)
+                        ),
+                    ):
+                        try:
+                            repository.set_active_conversation(
+                                active_user,
+                                recent_conversation["id"],
+                            )
+                        except (ValueError, ConversationStoreError) as error:
+                            st.error(
+                                str(error),
+                                title="Could not open conversation",
+                            )
+                        else:
+                            st.rerun()
+
+        with st.expander("Workspace settings"):
+            with st.form("dashboard_scope"):
+                user_id = st.text_input(
+                    "Local user ID",
+                    value=active_user,
+                    help="Selects local transcripts and graph data; it does "
+                         "not authenticate a user.",
+                )
+                graph_path = st.text_input(
+                    "Graph file",
+                    value=active_graph_path,
+                )
+                refresh = st.form_submit_button(
+                    "Save workspace",
+                    icon=":material/save:",
+                    width="stretch",
+                )
+            if refresh:
+                st.session_state["dashboard_user_id"] = user_id.strip()
+                st.session_state["dashboard_graph_path"] = graph_path.strip()
+                cached_snapshot.clear()
+                st.rerun()
+            st.caption(
+                "Conversation transcripts are stored locally in "
+                "data/conversations.json. This user selector is not "
+                "authentication; keep the app on localhost."
+            )
+
+    active_user = st.session_state.get("dashboard_user_id", "")
+    if section == "Conversation":
+        command_notice = st.session_state.pop(
+            "dashboard_command_notice",
+            None,
+        )
+        if command_notice:
+            st.info(command_notice, title="Command completed")
+        if conversation_store_error and not user_data["conversations"]:
+            st.error(
+                "Local conversation history could not be read. Check the "
+                "file format and local permissions; no transcript was "
+                "overwritten.",
+                title="Conversation history unavailable",
+            )
+            with st.expander("Technical details"):
+                st.caption(str(conversation_store_error))
+            return
+        if conversation_store_error or unsaved_history_error:
+            st.warning(
+                "One or more conversations are available only in this "
+                "browser session because local history could not be saved. "
+                "Keep this page open until storage is available.",
+                title="Unsaved conversation history",
+            )
+            with st.expander("Technical details"):
+                st.caption(
+                    str(unsaved_history_error or conversation_store_error)
+                )
+        if malformed_history:
+            st.warning(
+                "Some invalid history entries were skipped, or an unfinished "
+                "request from a previous run was marked as failed. Other "
+                "messages were preserved.",
+                icon=":material/warning:",
+            )
+        _render_conversation(st, active_user, repository, user_data)
+        return
+
     st.title("Mem0 memory operations")
     st.caption(
         "A read-only view of graph health, memory connectivity, and "
@@ -1151,19 +1933,6 @@ def main():
             icon=":material/warning:",
         )
 
-    section = st.segmented_control(
-        "Dashboard section",
-        (
-            "Overview",
-            "Memory explorer",
-            "Knowledge graph",
-            "Recovery centre",
-            "Data integrity",
-            "Performance and diagnostics",
-        ),
-        default="Overview",
-        key="dashboard_section",
-    )
     if section == "Memory explorer":
         _render_memory_explorer(st, snapshot)
     elif section == "Knowledge graph":

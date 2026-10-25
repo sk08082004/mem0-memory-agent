@@ -7,13 +7,18 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 
 from app.performance import timed_operation
 
 
 class KnowledgeGraph:
     RELATIONSHIP_RECOVERY_KEY = "relationship_recovery"
+    MEM0_OPERATIONS_KEY = "mem0_operations"
+    RELATIONSHIP_REVISIONS_KEY = "relationship_revisions"
     MAX_RECOVERY_RECORDS = 200
+    MAX_MEM0_OPERATIONS = 200
+    MAX_RELATIONSHIP_REVISIONS = 50
     MAX_RECOVERY_ATTEMPTS = 3
     MAX_EXPECTED_EDGES = 10
     MAX_RECOVERY_ERROR_LENGTH = 240
@@ -217,6 +222,30 @@ class KnowledgeGraph:
                 or not isinstance(edge.get("relationship"), str)
                 or not edge["relationship"].strip()
                 or len(edge["relationship"]) > 256
+                or (
+                    edge.get("source_id") is not None
+                    and (
+                        not isinstance(edge.get("source_id"), str)
+                        or not edge["source_id"].strip()
+                        or len(edge["source_id"]) > 256
+                    )
+                )
+                or (
+                    edge.get("evidence_ids") is not None
+                    and (
+                        not isinstance(edge.get("evidence_ids"), list)
+                        or not edge["evidence_ids"]
+                        or len(edge["evidence_ids"]) > 5
+                        or any(
+                            not isinstance(memory_id, str)
+                            or not memory_id.strip()
+                            or len(memory_id) > 256
+                            for memory_id in edge["evidence_ids"]
+                        )
+                        or len(set(edge["evidence_ids"]))
+                        != len(edge["evidence_ids"])
+                    )
+                )
             ):
                 return False
         if (
@@ -337,6 +366,445 @@ class KnowledgeGraph:
         ):
             raise ValueError("Cannot update an invalid user graph.")
         return copy.deepcopy(current)
+
+    @classmethod
+    def _valid_mem0_operation(cls, operation):
+        return (
+            isinstance(operation, dict)
+            and isinstance(operation.get("operation_id"), str)
+            and bool(operation["operation_id"].strip())
+            and (
+                operation.get("event_id") is None
+                or (
+                    isinstance(operation.get("event_id"), str)
+                    and bool(operation["event_id"].strip())
+                    and len(operation["event_id"]) <= 256
+                )
+            )
+            and isinstance(operation.get("memory_text"), str)
+            and bool(operation["memory_text"].strip())
+            and isinstance(operation.get("status"), str)
+            and operation["status"] in {
+                "pending",
+                "succeeded",
+                "succeeded_without_memory_id",
+                "failed",
+                "outcome_uncertain",
+            }
+            and (
+                operation.get("memory_id") is None
+                or (
+                    isinstance(operation.get("memory_id"), str)
+                    and bool(operation["memory_id"].strip())
+                    and len(operation["memory_id"]) <= 256
+                )
+            )
+            and isinstance(operation.get("operation_type"), str)
+            and operation["operation_type"] in {
+                "add",
+                "update",
+                "merge",
+            }
+            and isinstance(operation.get("created_at"), str)
+            and isinstance(operation.get("related_memory_ids"), list)
+            and all(
+                isinstance(memory_id, str)
+                and bool(memory_id.strip())
+                and len(memory_id) <= 256
+                for memory_id in operation["related_memory_ids"]
+            )
+            and isinstance(
+                operation.get("deleted_related_memory_ids", []),
+                list,
+            )
+            and all(
+                memory_id in operation["related_memory_ids"]
+                for memory_id in operation.get(
+                    "deleted_related_memory_ids",
+                    [],
+                )
+            )
+        )
+
+    def get_pending_mem0_operations(self, user_id):
+        with self._lock:
+            user_graph = self.graph.get(user_id, {})
+            operations = (
+                user_graph.get(self.MEM0_OPERATIONS_KEY, [])
+                if isinstance(user_graph, dict)
+                else []
+            )
+            if (
+                not isinstance(operations, list)
+                or len(operations) > self.MAX_MEM0_OPERATIONS
+            ):
+                raise ValueError("The pending Mem0 operation ledger is invalid.")
+            if any(
+                not self._valid_mem0_operation(operation)
+                for operation in operations
+            ):
+                raise ValueError("The pending Mem0 operation ledger is invalid.")
+            return copy.deepcopy(
+                [
+                    operation
+                    for operation in operations
+                    if operation["status"] not in {"failed"}
+                ]
+            )
+
+    def record_mem0_operation(
+        self,
+        user_id,
+        event_id,
+        memory_text,
+        status,
+        operation_type="add",
+        related_memory_ids=None,
+        memory_id=None,
+        operation_id=None,
+    ):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or (
+                event_id is not None
+                and (
+                    not isinstance(event_id, str)
+                    or not event_id.strip()
+                    or len(event_id) > 256
+                )
+            )
+            or not isinstance(memory_text, str)
+            or not memory_text.strip()
+            or status not in {
+                "pending",
+                "succeeded",
+                "succeeded_without_memory_id",
+                "failed",
+                "outcome_uncertain",
+            }
+            or operation_type not in {"add", "update", "merge"}
+            or (
+                memory_id is not None
+                and (
+                    not isinstance(memory_id, str)
+                    or not memory_id.strip()
+                    or len(memory_id) > 256
+                )
+            )
+        ):
+            raise ValueError("Mem0 operation details are invalid.")
+        related_memory_ids = (
+            list(related_memory_ids or [])
+            if isinstance(related_memory_ids, (list, tuple))
+            else None
+        )
+        operation = {
+            "operation_id": operation_id or uuid.uuid4().hex,
+            "event_id": event_id,
+            "memory_text": memory_text,
+            "status": status,
+            "operation_type": operation_type,
+            "related_memory_ids": related_memory_ids or [],
+            "deleted_related_memory_ids": [],
+            "memory_id": memory_id,
+            "created_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(),
+            ),
+        }
+        if not self._valid_mem0_operation(operation):
+            raise ValueError("Mem0 operation details are invalid.")
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            operations = user_graph.get(self.MEM0_OPERATIONS_KEY, [])
+            if not isinstance(operations, list):
+                raise ValueError("The pending Mem0 operation ledger is invalid.")
+            if len(operations) > self.MAX_MEM0_OPERATIONS:
+                raise ValueError("The pending Mem0 operation ledger is full.")
+            existing = next(
+                (
+                    entry
+                    for entry in operations
+                    if (
+                        (event_id and entry.get("event_id") == event_id)
+                        or entry.get("operation_id") == operation["operation_id"]
+                    )
+                ),
+                None,
+            )
+            if existing is None:
+                if len(operations) >= self.MAX_MEM0_OPERATIONS:
+                    raise ValueError("The pending Mem0 operation ledger is full.")
+                operations.append(operation)
+            else:
+                operation["operation_id"] = existing["operation_id"]
+                operations[operations.index(existing)] = operation
+            user_graph[self.MEM0_OPERATIONS_KEY] = operations
+            self._commit_user_graph(user_id, user_graph)
+        return copy.deepcopy(operation)
+
+    def update_mem0_operation(
+        self,
+        user_id,
+        operation_id,
+        status,
+        memory_id=None,
+        deleted_related_memory_ids=None,
+    ):
+        if status not in {
+            "pending",
+            "succeeded",
+            "succeeded_without_memory_id",
+            "failed",
+            "outcome_uncertain",
+        }:
+            raise ValueError("Mem0 operation status is invalid.")
+        if memory_id is not None and (
+            not isinstance(memory_id, str)
+            or not memory_id.strip()
+            or len(memory_id) > 256
+        ):
+            raise ValueError("Mem0 memory ID is invalid.")
+        if deleted_related_memory_ids is not None and (
+            not isinstance(deleted_related_memory_ids, (list, tuple))
+            or any(
+                not isinstance(old_id, str)
+                or not old_id.strip()
+                or len(old_id) > 256
+                for old_id in deleted_related_memory_ids
+            )
+        ):
+            raise ValueError("Deleted related memory IDs are invalid.")
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            operations = user_graph.get(self.MEM0_OPERATIONS_KEY, [])
+            if not isinstance(operations, list):
+                raise ValueError("The pending Mem0 operation ledger is invalid.")
+            operation = next(
+                (
+                    entry
+                    for entry in operations
+                    if entry.get("operation_id") == operation_id
+                ),
+                None,
+            )
+            if not self._valid_mem0_operation(operation):
+                return False
+            operation["status"] = status
+            operation["memory_id"] = memory_id
+            if deleted_related_memory_ids is not None:
+                deleted_related_memory_ids = list(
+                    dict.fromkeys(deleted_related_memory_ids)
+                )
+                if any(
+                    old_id not in operation["related_memory_ids"]
+                    for old_id in deleted_related_memory_ids
+                ):
+                    raise ValueError(
+                        "Deleted memory IDs must belong to the operation."
+                    )
+                operation["deleted_related_memory_ids"] = (
+                    deleted_related_memory_ids
+                )
+            user_graph[self.MEM0_OPERATIONS_KEY] = operations
+            self._commit_user_graph(user_id, user_graph)
+            return True
+
+    def reconcile_mem0_operation(
+        self,
+        user_id,
+        operation_id,
+        memory_id,
+        retain_operation=False,
+    ):
+        if (
+            not isinstance(memory_id, str)
+            or not memory_id.strip()
+            or len(memory_id) > 256
+            or type(retain_operation) is not bool
+        ):
+            raise ValueError("A verified Mem0 memory ID is required.")
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            operations = user_graph.get(self.MEM0_OPERATIONS_KEY, [])
+            if not isinstance(operations, list):
+                raise ValueError("The pending Mem0 operation ledger is invalid.")
+            operation = next(
+                (
+                    entry
+                    for entry in operations
+                    if entry.get("operation_id") == operation_id
+                ),
+                None,
+            )
+            if (
+                not self._valid_mem0_operation(operation)
+                or operation.get("status") != "succeeded"
+                or operation.get("memory_id") != memory_id
+            ):
+                return False
+
+            node = next(
+                (
+                    item
+                    for item in user_graph["nodes"]
+                    if isinstance(item, dict) and item.get("id") == memory_id
+                ),
+                None,
+            )
+            if node is None:
+                user_graph["nodes"].append(
+                    {
+                        "id": memory_id,
+                        "memory_text": operation["memory_text"],
+                    }
+                )
+            else:
+                node["memory_text"] = operation["memory_text"]
+
+            if not retain_operation:
+                user_graph[self.MEM0_OPERATIONS_KEY] = [
+                    entry
+                    for entry in operations
+                    if entry.get("operation_id") != operation_id
+                ]
+            self._commit_user_graph(user_id, user_graph)
+            return True
+
+    def reconcile_mem0_replacement_operation(
+        self,
+        user_id,
+        operation_id,
+        replacement_id,
+    ):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or not isinstance(operation_id, str)
+            or not operation_id.strip()
+            or not isinstance(replacement_id, str)
+            or not replacement_id.strip()
+            or len(replacement_id) > 256
+        ):
+            raise ValueError("Mem0 replacement details are invalid.")
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            operations = user_graph.get(self.MEM0_OPERATIONS_KEY, [])
+            if not isinstance(operations, list):
+                raise ValueError("The pending Mem0 operation ledger is invalid.")
+            operation = next(
+                (
+                    entry
+                    for entry in operations
+                    if entry.get("operation_id") == operation_id
+                ),
+                None,
+            )
+            if (
+                not self._valid_mem0_operation(operation)
+                or operation.get("operation_type") not in {"update", "merge"}
+                or operation.get("status") != "succeeded"
+                or operation.get("memory_id") != replacement_id
+                or set(operation["related_memory_ids"])
+                != set(operation.get("deleted_related_memory_ids", []))
+            ):
+                return {"status": "operation_not_ready"}
+
+            related_ids = set(operation["related_memory_ids"]) - {
+                replacement_id
+            }
+            replacement_node = next(
+                (
+                    node
+                    for node in user_graph["nodes"]
+                    if isinstance(node, dict)
+                    and node.get("id") == replacement_id
+                ),
+                None,
+            )
+            if replacement_node is None:
+                user_graph["nodes"].append(
+                    {
+                        "id": replacement_id,
+                        "memory_text": operation["memory_text"],
+                    }
+                )
+            else:
+                replacement_node["memory_text"] = operation["memory_text"]
+
+            user_graph["nodes"] = [
+                node
+                for node in user_graph["nodes"]
+                if not (
+                    isinstance(node, dict)
+                    and node.get("id") in related_ids
+                )
+            ]
+            user_graph["relationships"] = [
+                edge
+                for edge in user_graph["relationships"]
+                if not (
+                    isinstance(edge, dict)
+                    and (
+                        edge.get("source") in related_ids
+                        or edge.get("target") in related_ids
+                    )
+                )
+            ]
+
+            blocked_sources = []
+            recovery = user_graph.get(self.RELATIONSHIP_RECOVERY_KEY)
+            if isinstance(recovery, dict):
+                reason = (
+                    f"Source memory was replaced by {replacement_id}; "
+                    "relationships were not redirected."
+                )[:self.MAX_RECOVERY_ERROR_LENGTH]
+                for old_id in related_ids:
+                    old_record = recovery.get(old_id)
+                    if (
+                        self._valid_recovery_record(old_record)
+                        and old_record.get("source_id") == old_id
+                    ):
+                        old_record["status"] = "superseded"
+                        old_record["replacement_id"] = replacement_id
+                        old_record["error"] = reason
+                    for source_id, record in recovery.items():
+                        if (
+                            source_id in related_ids
+                            or not self._valid_recovery_record(record)
+                            or record["status"] not in {
+                                "pending_generation",
+                                "pending_persistence",
+                                "failed",
+                            }
+                        ):
+                            continue
+                        if any(
+                            old_id
+                            in {
+                                edge.get("source_id", source_id),
+                                edge.get("target_id"),
+                            }
+                            or old_id in edge.get("evidence_ids", [])
+                            for edge in record.get("expected_edges", [])
+                        ):
+                            record["status"] = "blocked_missing_endpoint"
+                            record["error"] = reason
+                            blocked_sources.append(source_id)
+
+            user_graph[self.MEM0_OPERATIONS_KEY] = [
+                entry
+                for entry in operations
+                if entry.get("operation_id") != operation_id
+            ]
+            self._commit_user_graph(user_id, user_graph)
+            return {
+                "status": "reconciled",
+                "blocked_sources": sorted(set(blocked_sources)),
+            }
 
     @staticmethod
     def _node_ids(user_graph):
@@ -539,9 +1007,43 @@ class KnowledgeGraph:
                 or not isinstance(edge.get("relationship"), str)
                 or not edge["relationship"].strip()
                 or len(edge["relationship"]) > 256
+                or (
+                    edge.get("source_id") is not None
+                    and (
+                        not isinstance(edge.get("source_id"), str)
+                        or not edge["source_id"].strip()
+                        or len(edge["source_id"]) > 256
+                    )
+                )
+                or (
+                    edge.get("evidence_ids") is not None
+                    and (
+                        not isinstance(edge.get("evidence_ids"), list)
+                        or not edge["evidence_ids"]
+                        or len(edge["evidence_ids"]) > 5
+                        or any(
+                            not isinstance(memory_id, str)
+                            or not memory_id.strip()
+                            or len(memory_id) > 256
+                            for memory_id in edge["evidence_ids"]
+                        )
+                        or len(set(edge["evidence_ids"]))
+                        != len(edge["evidence_ids"])
+                    )
+                )
                 for edge in edges
             )
         ):
+            return False
+        identities = [
+            (
+                edge.get("source_id", source_id),
+                edge["target_id"],
+                edge["relationship"],
+            )
+            for edge in edges
+        ]
+        if len(identities) != len(set(identities)):
             return False
 
         with self._lock:
@@ -556,19 +1058,50 @@ class KnowledgeGraph:
 
             node_ids = self._node_ids(user_graph)
             if source_id not in node_ids or any(
-                edge["target_id"] not in node_ids for edge in edges
+                edge.get("source_id", source_id) not in node_ids
+                or edge["target_id"] not in node_ids
+                or edge.get("source_id", source_id) == edge["target_id"]
+                or (
+                    "evidence_ids" in edge
+                    and any(
+                        evidence_id not in node_ids
+                        for evidence_id in edge["evidence_ids"]
+                    )
+                )
+                or (
+                    "evidence_ids" in edge
+                    and not {
+                        edge.get("source_id", source_id),
+                        edge["target_id"],
+                    }.issubset(set(edge["evidence_ids"]))
+                )
+                for edge in edges
             ):
                 return False
 
             record["status"] = "pending_persistence"
             record["error"] = None
-            record["expected_edges"] = [
-                {
+            record["expected_edges"] = []
+            seen = set()
+            for edge in edges:
+                source = edge.get("source_id", source_id)
+                identity = (
+                    source,
+                    edge["target_id"],
+                    edge["relationship"],
+                )
+                if identity in seen:
+                    return False
+                seen.add(identity)
+                pending_edge = {
                     "target_id": edge["target_id"],
                     "relationship": edge["relationship"],
                 }
-                for edge in edges
-            ]
+                if source != source_id:
+                    pending_edge["source_id"] = source
+                if "evidence_ids" in edge:
+                    pending_edge["evidence_ids"] = list(edge["evidence_ids"])
+                record["expected_edges"].append(pending_edge)
             queue[source_id] = record
             user_graph[self.RELATIONSHIP_RECOVERY_KEY] = queue
             self._commit_user_graph(user_id, user_graph)
@@ -605,6 +1138,22 @@ class KnowledgeGraph:
                 or not isinstance(edge.get("target_id"), str)
                 or not edge["target_id"].strip()
                 or edge.get("target_id") not in node_ids
+                or edge.get("source_id", source_id) not in node_ids
+                or edge.get("source_id", source_id) == edge.get("target_id")
+                or (
+                    "evidence_ids" in edge
+                    and any(
+                        evidence_id not in node_ids
+                        for evidence_id in edge["evidence_ids"]
+                    )
+                )
+                or (
+                    "evidence_ids" in edge
+                    and not {
+                        edge.get("source_id", source_id),
+                        edge["target_id"],
+                    }.issubset(set(edge["evidence_ids"]))
+                )
                 or not isinstance(edge.get("relationship"), str)
                 or not edge["relationship"].strip()
                 for edge in record["expected_edges"]
@@ -614,11 +1163,22 @@ class KnowledgeGraph:
             relationships = user_graph["relationships"]
             for edge in record["expected_edges"]:
                 candidate = {
-                    "source": source_id,
+                    "source": edge.get("source_id", source_id),
                     "target": edge["target_id"],
                     "relationship": edge["relationship"],
                 }
-                if candidate not in relationships:
+                evidence_ids = edge.get("evidence_ids")
+                if evidence_ids:
+                    candidate["evidence_ids"] = list(evidence_ids)
+                duplicate = any(
+                    isinstance(existing, dict)
+                    and all(
+                        existing.get(key) == candidate[key]
+                        for key in ("source", "target", "relationship")
+                    )
+                    for existing in relationships
+                )
+                if not duplicate:
                     relationships.append(candidate)
 
             record["status"] = "succeeded"
@@ -693,10 +1253,9 @@ class KnowledgeGraph:
         user_id,
         source_id,
         target_id,
-        relationship
+        relationship,
     ):
         """Add an edge if both endpoints exist; return False when rejected."""
-
         if (
             not isinstance(user_id, str)
             or not user_id.strip()
@@ -717,39 +1276,266 @@ class KnowledgeGraph:
                 or not isinstance(user_graph.get("relationships"), list)
             ):
                 return False
-
-            node_ids = {
-                node.get("id")
-                for node in user_graph["nodes"]
-                if (
-                    isinstance(node, dict)
-                    and isinstance(node.get("id"), str)
-                    and node["id"].strip()
-                )
-            }
+            node_ids = self._node_ids(user_graph)
             if source_id not in node_ids or target_id not in node_ids:
                 return False
-
-            for edge in user_graph["relationships"]:
-                if (
-                    isinstance(edge, dict)
-                    and edge.get("source") == source_id
-                    and edge.get("target") == target_id
-                    and edge.get("relationship") == relationship
-                ):
-                    return True
+            if any(
+                isinstance(edge, dict)
+                and self._relationship_identity(edge)
+                == (source_id, target_id, relationship)
+                for edge in user_graph["relationships"]
+            ):
+                return True
 
             updated_user_graph = copy.deepcopy(user_graph)
             updated_user_graph["relationships"].append(
                 {
                     "source": source_id,
                     "target": target_id,
-                    "relationship": relationship
+                    "relationship": relationship,
                 }
             )
-
             self._commit_user_graph(user_id, updated_user_graph)
             return True
+
+    @staticmethod
+    def _relationship_identity(edge):
+        return (
+            edge.get("source"),
+            edge.get("target"),
+            edge.get("relationship"),
+        )
+
+    def apply_relationship_revision(
+        self,
+        user_id,
+        revision_id,
+        reason,
+        remove_edges,
+        add_edges,
+    ):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or not isinstance(revision_id, str)
+            or not revision_id.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or not isinstance(remove_edges, list)
+            or not isinstance(add_edges, list)
+        ):
+            raise ValueError("Relationship revision details are invalid.")
+
+        def valid_edge(edge):
+            valid = (
+                isinstance(edge, dict)
+                and isinstance(edge.get("source"), str)
+                and bool(edge["source"].strip())
+                and isinstance(edge.get("target"), str)
+                and bool(edge["target"].strip())
+                and isinstance(edge.get("relationship"), str)
+                and bool(edge["relationship"].strip())
+            )
+            if not valid:
+                return False
+            evidence_ids = edge.get("evidence_ids")
+            return (
+                evidence_ids is None
+                or (
+                    isinstance(evidence_ids, list)
+                    and 2 <= len(evidence_ids) <= 5
+                    and all(
+                        isinstance(memory_id, str)
+                        and memory_id.strip()
+                        for memory_id in evidence_ids
+                    )
+                    and len(set(evidence_ids)) == len(evidence_ids)
+                    and {
+                        edge["source"],
+                        edge["target"],
+                    }.issubset(set(evidence_ids))
+                )
+            )
+
+        if any(not valid_edge(edge) for edge in remove_edges + add_edges):
+            raise ValueError("Relationship revision contains an invalid edge.")
+        remove_keys = [self._relationship_identity(edge) for edge in remove_edges]
+        add_keys = [self._relationship_identity(edge) for edge in add_edges]
+        if len(remove_keys) != len(set(remove_keys)) or len(add_keys) != len(
+            set(add_keys)
+        ):
+            raise ValueError("Relationship revision contains duplicate edges.")
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            revisions = user_graph.get(self.RELATIONSHIP_REVISIONS_KEY, [])
+            if (
+                not isinstance(revisions, list)
+                or len(revisions) > self.MAX_RELATIONSHIP_REVISIONS
+                or any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("revision_id"), str)
+                    for item in revisions
+                )
+            ):
+                raise ValueError("Relationship revision journal is invalid.")
+            existing = next(
+                (item for item in revisions if item["revision_id"] == revision_id),
+                None,
+            )
+            if existing is not None:
+                return {
+                    "status": existing.get("status", "invalid"),
+                    "revision_id": revision_id,
+                }
+            if len(revisions) >= self.MAX_RELATIONSHIP_REVISIONS:
+                raise ValueError("Relationship revision journal is full.")
+
+            node_ids = self._node_ids(user_graph)
+            if any(
+                edge["source"] not in node_ids or edge["target"] not in node_ids
+                or any(
+                    evidence_id not in node_ids
+                    for evidence_id in edge.get("evidence_ids", [])
+                )
+                for edge in add_edges
+            ):
+                raise ValueError("Relationship revision has a missing endpoint.")
+
+            current = user_graph["relationships"]
+            removed = []
+            remaining = list(current)
+            for key in remove_keys:
+                matches = [
+                    edge
+                    for edge in remaining
+                    if (
+                        isinstance(edge, dict)
+                        and self._relationship_identity(edge) == key
+                    )
+                ]
+                if not matches:
+                    raise ValueError(
+                        "Relationship revision removal edge does not exist."
+                    )
+                removed.extend(copy.deepcopy(matches))
+                remaining = [
+                    edge
+                    for edge in remaining
+                    if (
+                        not isinstance(edge, dict)
+                        or self._relationship_identity(edge) != key
+                    )
+                ]
+
+            remaining_keys = {
+                self._relationship_identity(edge)
+                for edge in remaining
+                if isinstance(edge, dict)
+            }
+            if any(key in remaining_keys for key in add_keys):
+                raise ValueError("Relationship revision would duplicate an edge.")
+
+            added = copy.deepcopy(add_edges)
+            user_graph["relationships"] = remaining + added
+            revisions.append(
+                {
+                    "revision_id": revision_id,
+                    "reason": reason,
+                    "created_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ",
+                        time.gmtime(),
+                    ),
+                    "status": "applied",
+                    "removed_edges": removed,
+                    "added_edges": added,
+                }
+            )
+            user_graph[self.RELATIONSHIP_REVISIONS_KEY] = revisions
+            self._commit_user_graph(user_id, user_graph)
+            return {"status": "applied", "revision_id": revision_id}
+
+    def rollback_relationship_revision(self, user_id, revision_id):
+        if (
+            not isinstance(user_id, str)
+            or not user_id.strip()
+            or not isinstance(revision_id, str)
+            or not revision_id.strip()
+        ):
+            raise ValueError("Relationship revision identifiers are invalid.")
+
+        with self._lock:
+            user_graph = self._user_graph_copy(user_id)
+            revisions = user_graph.get(self.RELATIONSHIP_REVISIONS_KEY, [])
+            if not isinstance(revisions, list):
+                raise ValueError("Relationship revision journal is invalid.")
+            revision = next(
+                (
+                    item
+                    for item in revisions
+                    if (
+                        isinstance(item, dict)
+                        and item.get("revision_id") == revision_id
+                    )
+                ),
+                None,
+            )
+            if revision is None:
+                return {"status": "not_found", "revision_id": revision_id}
+            if revision.get("status") == "reverted":
+                return {"status": "reverted", "revision_id": revision_id}
+            if (
+                revision.get("status") != "applied"
+                or not isinstance(revision.get("removed_edges"), list)
+                or not isinstance(revision.get("added_edges"), list)
+            ):
+                return {"status": "invalid", "revision_id": revision_id}
+
+            node_ids = self._node_ids(user_graph)
+            if any(
+                not isinstance(edge, dict)
+                or edge.get("source") not in node_ids
+                or edge.get("target") not in node_ids
+                for edge in revision["removed_edges"]
+            ):
+                return {
+                    "status": "blocked_missing_endpoint",
+                    "revision_id": revision_id,
+                }
+
+            relationships = user_graph["relationships"]
+            for added_edge in revision["added_edges"]:
+                if not any(edge == added_edge for edge in relationships):
+                    return {
+                        "status": "blocked_changed_edge",
+                        "revision_id": revision_id,
+                    }
+            added_edges = revision["added_edges"]
+            relationships = [
+                edge for edge in relationships if edge not in added_edges
+            ]
+            restored_keys = {
+                self._relationship_identity(edge)
+                for edge in relationships
+                if isinstance(edge, dict)
+            }
+            for removed_edge in revision["removed_edges"]:
+                key = self._relationship_identity(removed_edge)
+                if key not in restored_keys:
+                    relationships.extend(
+                        copy.deepcopy(
+                            [
+                                edge
+                                for edge in revision["removed_edges"]
+                                if self._relationship_identity(edge) == key
+                            ]
+                        )
+                    )
+                    restored_keys.add(key)
+            user_graph["relationships"] = relationships
+            revision["status"] = "reverted"
+            self._commit_user_graph(user_id, user_graph)
+            return {"status": "reverted", "revision_id": revision_id}
 
     def delete_node(
         self,
@@ -876,7 +1662,12 @@ class KnowledgeGraph:
                         continue
                     expected_edges = record.get("expected_edges", [])
                     if any(
-                        edge.get("target_id") == old_memory_id
+                        old_memory_id
+                        in {
+                            edge.get("source_id", source_id),
+                            edge.get("target_id"),
+                        }
+                        or old_memory_id in edge.get("evidence_ids", [])
                         for edge in expected_edges
                     ):
                         record["status"] = "blocked_missing_endpoint"
@@ -1001,7 +1792,18 @@ class KnowledgeGraph:
                         isinstance(expected_edges, list)
                         and any(
                             isinstance(edge, dict)
-                            and edge.get("target_id") not in current_ids
+                            and (
+                                edge.get("target_id") not in current_ids
+                                or edge.get("source_id", source_id)
+                                not in current_ids
+                                or any(
+                                    evidence_id not in current_ids
+                                    for evidence_id in edge.get(
+                                        "evidence_ids",
+                                        [],
+                                    )
+                                )
+                            )
                             for edge in expected_edges
                         )
                     )
